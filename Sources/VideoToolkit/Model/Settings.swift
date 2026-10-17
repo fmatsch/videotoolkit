@@ -23,6 +23,7 @@ struct VideoSettings: Equatable {
     var deband: Double = 0              // 0 ... 1 (Streifen in Verläufen verdecken)
     var deinterlace: Bool = false       // Kammartefakte entfernen
     var reframe: Reframe = .none        // Hochformat/Quadrat mit Personenverfolgung
+    var reframeScaleHD: Bool = true     // Ausschnitt auf 1080 px Breite skalieren
     var upscale: Double = 1             // 1, 1.5, 2, 3
     var aiUpscale: Bool = false         // Real-ESRGAN statt Lanczos
     var referenceStrength: Double = 0   // 0 ... 1

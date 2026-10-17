@@ -125,6 +125,7 @@ enum CLI {
                 if let i = args.firstIndex(of: "--vig") { v.vignetteFix = Double(args[i + 1]) ?? 0 }
                 if let i = args.firstIndex(of: "--deband") { v.deband = Double(args[i + 1]) ?? 0 }
                 if args.contains("--deint") { v.deinterlace = true }
+                if let i = args.firstIndex(of: "--reframe") { v.reframe = ["v": .vertical, "p": .portrait, "s": .square][args[i + 1]] ?? .none; v.reframeScaleHD = !args.contains("--no-hd") }
                 if let i = args.firstIndex(of: "--rs") { v.rollingShutter = Double(args[i + 1]) ?? 0 }
                 if args.contains("--force-all") {
                     v.denoiseSpatial = 0.6; v.denoiseTemporal = 0.8; v.sharpen = 1; v.upscale = 2; v.aiUpscale = AIModels.upscalerAvailable

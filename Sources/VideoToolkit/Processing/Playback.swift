@@ -69,6 +69,25 @@ enum PlaybackRenderer {
         img = FilterChain.color(img, settings)
         img = FilterChain.finish(img, settings, lut: lut, scale: 1)
         img = img.cropped(to: rect)
+        if settings.reframe.aspect != nil, let a = snap.reframeAspect {
+            // Hochformat/Quadrat: Ausschnitt auf die verfolgte Person, zentriert auf schwarzer Fläche
+            let W = rect.width, H = rect.height
+            var cw = W, ch = H
+            if CGFloat(a) < W / H { cw = H * CGFloat(a) } else { ch = W / CGFloat(a) }
+            var cx = 0.5, cy = 0.5
+            if idx < snap.reframeCenters.count {
+                let raw = snap.reframeCenters[idx]
+                let dx = Double(raw.x) - 0.5, dy = Double(raw.y) - 0.5
+                cx = 0.5 + Double(o.a) * dx - Double(o.c) * dy
+                cy = 0.5 + Double(o.d) * dy - Double(o.b) * dx
+            }
+            let x0 = min(max(0, CGFloat(cx) * W - cw / 2), W - cw), y0 = min(max(0, CGFloat(cy) * H - ch / 2), H - ch)
+            let sc = min(W / cw, H / ch)
+            let placed = img.cropped(to: CGRect(x: x0, y: y0, width: cw, height: ch))
+                .transformed(by: CGAffineTransform(translationX: -x0, y: -y0).concatenating(CGAffineTransform(scaleX: sc, y: sc))
+                    .concatenating(CGAffineTransform(translationX: (W - cw * sc) / 2, y: (H - ch * sc) / 2)))
+            img = placed.composited(over: CIImage(color: .black).cropped(to: rect))
+        }
 
         switch snap.compare {
         case .after: return img

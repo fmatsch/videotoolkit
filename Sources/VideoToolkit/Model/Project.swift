@@ -69,6 +69,8 @@ final class Project: ObservableObject {
     let playback = PlaybackController()
     private var playbackSink: AnyCancellable?
     private var fullMotionTask: Task<Void, Never>?
+    private var reframeCenters: [CGPoint] = []
+    private var trackingTask: Task<Void, Never>?
     @Published var duration: Double = 0
     private var renderer: PreviewRenderer?
     private var stabCache: (key: [Double], frames: [MotionPass.StabFrame], zoom: CGFloat)?
@@ -95,7 +97,7 @@ final class Project: ObservableObject {
 
     func open(_ url: URL) {
         stopAudio()
-        exportTask?.cancel(); fullMotionTask?.cancel(); playback.stop(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
+        exportTask?.cancel(); fullMotionTask?.cancel(); trackingTask?.cancel(); reframeCenters = []; trackingTask = nil; playback.stop(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
         sceneMode = false; scenes = []; sceneReference = nil; sceneReferenceLabel = nil; sceneReferenceSceneID = nil
         sceneProgress = nil; sceneCutFrames = []
         self.url = url
@@ -286,6 +288,7 @@ final class Project: ObservableObject {
     }
 
     private func videoChanged(old: VideoSettings) {
+        ensureTracking()
         if referenceImage != nil, old.preReferenceKey != video.preReferenceKey { rebuildLUT() }
         schedulePreview()
     }
@@ -337,13 +340,29 @@ final class Project: ObservableObject {
         let fps = va.motion?.fps ?? va.fps, aw = va.motion?.analysisWidth ?? 480
         let ah = aw * Double(va.height) / Double(va.width)
         let orient = videoOrientation
+        let centers = reframeCenters, aspect = video.reframe.aspect
         playback.state.update {
+            $0.reframeCenters = centers; $0.reframeAspect = aspect
             $0.settings = v; $0.lut = l; $0.sceneRenders = renders
             $0.stab = stab; $0.stabZoom = zoom; $0.gains = gains
             $0.fps = fps; $0.analysisWidth = aw; $0.analysisHeight = ah
             $0.orientation = orient; $0.compare = cmp; $0.split = spl
         }
         playback.refreshFrame()
+    }
+
+    /// Hochformat-/Quadrat-Ausschnitt: Person über das ganze Video verfolgen (einmalig, im Hintergrund).
+    private func ensureTracking() {
+        guard let asset, video.reframe != .none, reframeCenters.isEmpty, trackingTask == nil else { return }
+        playback.audioStatus = "Person wird verfolgt …"
+        trackingTask = Task {
+            if let c = try? await SubjectTracker.track(asset: asset, progress: { [weak self] p in
+                Task { @MainActor in self?.playback.audioStatus = String(format: "Person wird verfolgt … %.0f %%", p * 100) }
+            }) { reframeCenters = c }
+            playback.audioStatus = nil
+            trackingTask = nil
+            schedulePreview()
+        }
     }
 
     /// Stabilisierung/Flackern brauchen die Bewegungsdaten des ganzen Videos (Analyse deckt zunächst nur 90 s ab).
@@ -439,12 +458,13 @@ final class Project: ObservableObject {
         let renders: [SceneRender] = (sceneMode && sceneReference != nil)
             ? scenes.map { SceneRender(start: $0.start, enabled: $0.enabled, lut: $0.lut, strength: sceneMatchStrength) } : []
         let cuts = sceneMode ? sceneCutFrames : []
+        let centers = reframeCenters
         state = .exporting(0, "Starten …")
         lastExport = nil
         exportTask = Task {
             do {
                 try await Exporter.export(asset: asset, video: v, audio: a, noise: noise, motion: motion, lut: lut,
-                                          options: opts, to: dest, scenes: renders, sceneCuts: cuts) { [weak self] p, text in
+                                          options: opts, to: dest, scenes: renders, sceneCuts: cuts, reframeCenters: centers) { [weak self] p, text in
                     Task { @MainActor in self?.state = .exporting(p, text) }
                 }
                 lastExport = dest

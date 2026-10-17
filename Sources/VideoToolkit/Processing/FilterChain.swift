@@ -204,6 +204,24 @@ enum FilterChain {
         return img.cropped(to: target)
     }
 
+    /// Skaliert (Lanczos) exakt auf `size` und schärft; Eingabe muss bei Ursprung (0,0) liegen.
+    static func resizeSharpen(_ input: CIImage, _ s: VideoSettings, to size: CGSize) -> CIImage {
+        var img = input
+        let e = input.extent
+        if abs(size.width - e.width) > 0.5 || abs(size.height - e.height) > 0.5 {
+            let sc = size.height / e.height
+            img = img.applyingFilter("CILanczosScaleTransform", parameters: [
+                kCIInputScaleKey: sc, kCIInputAspectRatioKey: (size.width / e.width) / sc,
+            ])
+        }
+        if s.sharpen > 0.01 {
+            img = img.applyingFilter("CIUnsharpMask", parameters: [
+                kCIInputRadiusKey: max(1.0, size.width / 900), kCIInputIntensityKey: s.sharpen * 0.9,
+            ])
+        }
+        return img.cropped(to: CGRect(origin: .zero, size: size))
+    }
+
     static func finish(_ input: CIImage, _ s: VideoSettings, lut: ColorLUT?, scale: CGFloat, noiseOffset: CGPoint = .zero) -> CIImage {
         dither(scaleSharpen(applyLUT(input, s, lut: lut), s, scale: scale), s, offset: noiseOffset)
     }

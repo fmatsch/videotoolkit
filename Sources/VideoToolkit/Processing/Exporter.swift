@@ -23,7 +23,7 @@ struct ExportError: LocalizedError {
 enum Exporter {
     static func export(asset: AVURLAsset, video: VideoSettings, audio: AudioSettings, noise: NoiseProfile?,
                        motion: MotionData?, lut: ColorLUT?, options: ExportOptions, to url: URL,
-                       scenes: [SceneRender] = [], sceneCuts: Set<Int> = [],
+                       scenes: [SceneRender] = [], sceneCuts: Set<Int> = [], reframeCenters: [CGPoint] = [],
                        progress: @escaping (Double, String) -> Void) async throws {
         guard let vTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw ExportError(message: "Keine Videospur gefunden.")
@@ -54,6 +54,12 @@ enum Exporter {
         }
         let offsetScale = motionData.map { Double(natural.width) / $0.analysisWidth } ?? 1
 
+        // 1b. Personenverfolgung für den Bildausschnitt
+        var centers = reframeCenters
+        if ReframeGeometry.make(natural: natural, rotated90: abs(transform.b) > 0.01, settings: vs).active, centers.isEmpty {
+            progress(0.2, "Person verfolgen …")
+            centers = try await SubjectTracker.track(asset: asset) { progress(0.2 + 0.05 * $0, "Person verfolgen …") }
+        }
         // 2. Audio vorbereiten
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("VideoToolkit-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
@@ -76,8 +82,8 @@ enum Exporter {
         try? FileManager.default.removeItem(at: url)
         let fileType: AVFileType = url.pathExtension.lowercased() == "mov" ? .mov : .mp4
         let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
-        let outW = (Int((natural.width * CGFloat(vs.upscale)).rounded()) + 1) & ~1
-        let outH = (Int((natural.height * CGFloat(vs.upscale)).rounded()) + 1) & ~1
+        let geo = ReframeGeometry.make(natural: natural, rotated90: abs(transform.b) > 0.01, settings: vs)
+        let outW = geo.outW, outH = geo.outH
         let bitsPerPixel = 0.05 + 0.10 * options.quality
         let bitrate = Int(Double(outW * outH) * min(fps, 60) * bitsPerPixel * (options.codec == .hevc ? 0.65 : 1))
         var compression: [String: Any] = [
@@ -165,7 +171,9 @@ enum Exporter {
         var tempIndex = 0
         var prevTemporal: CIImage?
         var aiSrc: CVPixelBuffer?
-        let upscaler: AIUpscaler? = (vs.aiUpscale && vs.upscale > 1.01 && AIModels.upscalerAvailable) ? try await AIUpscaler.load() : nil
+        let effectiveScale = Double(geo.outH) / Double(geo.cropH)
+        let upscaler: AIUpscaler? = (vs.aiUpscale && effectiveScale > 1.01 && AIModels.upscalerAvailable) ? try await AIUpscaler.load() : nil
+        let outSize = CGSize(width: outW, height: outH)
         var frameIndex = 0
         var sceneIdx = 0
         let baseProgress = (vs.stabilize || vs.deflicker || vs.rollingShutter > 0.001) ? 0.3 : 0.1
@@ -217,20 +225,27 @@ enum Exporter {
                 }
                 params.noiseOffset = CGPoint(x: Double((frameIndex * 97) % 509), y: Double((frameIndex * 53) % 503))
                 img = FilterChain.color(img, fs)
+                // Referenz-LUT, dann Bildausschnitt (Hochformat/Quadrat) auf die verfolgte Person
+                var cropped = FilterChain.applyLUT(img, fs, lut: frameLUT)
+                var cropRect = rect
+                if geo.active {
+                    let c = frameIndex < centers.count ? centers[frameIndex] : CGPoint(x: 0.5, y: 0.5)
+                    cropRect = geo.cropRect(center: c, imageSize: rect.size)
+                    cropped = cropped.cropped(to: cropRect).transformed(by: CGAffineTransform(translationX: -cropRect.minX, y: -cropRect.minY))
+                }
                 if let ai = upscaler {
-                    // KI-Hochskalierung: Farbe + Referenz anwenden, in Puffer rendern, 4× hochrechnen, auf Zielgröße skalieren
-                    let base = FilterChain.applyLUT(img, fs, lut: frameLUT)
+                    // KI-Hochskalierung: in Puffer rendern, 4× hochrechnen, auf Zielgröße skalieren
                     if aiSrc == nil {
-                        CVPixelBufferCreate(nil, Int(rect.width), Int(rect.height), kCVPixelFormatType_32BGRA,
+                        CVPixelBufferCreate(nil, geo.cropW, geo.cropH, kCVPixelFormatType_32BGRA,
                                             [kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &aiSrc)
                     }
                     guard let src = aiSrc else { throw ExportError(message: "Pixelpuffer konnte nicht erzeugt werden.") }
-                    ctx.render(base, to: src, bounds: rect, colorSpace: FilterChain.colorSpace)
+                    ctx.render(cropped, to: src, bounds: CGRect(x: 0, y: 0, width: geo.cropW, height: geo.cropH), colorSpace: FilterChain.colorSpace)
                     let big = try ai.upscale4x(src)
                     let bigImg = CIImage(cvPixelBuffer: big, options: [.colorSpace: FilterChain.colorSpace])
-                    img = FilterChain.dither(FilterChain.scaleSharpen(bigImg, vs, scale: CGFloat(vs.upscale) / 4), vs, offset: params.noiseOffset)
+                    img = FilterChain.dither(FilterChain.resizeSharpen(bigImg, vs, to: outSize), vs, offset: params.noiseOffset)
                 } else {
-                    img = FilterChain.finish(img, fs, lut: frameLUT, scale: CGFloat(vs.upscale), noiseOffset: params.noiseOffset)
+                    img = FilterChain.dither(FilterChain.resizeSharpen(cropped, vs, to: outSize), vs, offset: params.noiseOffset)
                 }
 
                 guard let pool = adaptor.pixelBufferPool else { throw ExportError(message: "Kein Pixelpuffer-Pool.") }

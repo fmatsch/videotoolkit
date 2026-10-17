@@ -47,6 +47,16 @@ struct VideoTab: View {
                                     help: "Feines Rauschen gegen Banding. Nur im Export sichtbar.")
                         Toggle("Zeilensprung (Interlacing) entfernen", isOn: v.deinterlace)
                     }
+                    SectionCard(title: "Format & Bildausschnitt", icon: "rectangle.portrait.on.rectangle.portrait") {
+                        Picker("Zuschnitt", selection: v.reframe) {
+                            ForEach(Reframe.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        if project.video.reframe != .none {
+                            Toggle("Auf 1080 px Breite skalieren", isOn: v.reframeScaleHD)
+                            Text("Der Ausschnitt folgt automatisch der Hauptperson (Gesicht, sonst Körper) und wird zwischen den Szenen neu ausgerichtet. In der Vorschau steht das Format zentriert auf schwarzem Grund.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     SectionCard(title: "Auflösung", icon: "arrow.up.left.and.arrow.down.right") {
                         Picker("Hochskalieren", selection: v.upscale) {
                             Text("Original").tag(1.0); Text("1,5×").tag(1.5); Text("2×").tag(2.0); Text("3×").tag(3.0)
