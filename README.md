@@ -25,6 +25,12 @@ Benötigt nur Swift 5.9+ (Command Line Tools genügen, Xcode ist nicht nötig).
 * **Szenen-Angleich**: Das Video wird an den Schnitten in Szenen getrennt (automatische Schnitterkennung), jede Szene
   wird an ein Referenzbild aus dem Video (oder aus einer Datei) angeglichen und alles wird in einem Durchlauf wieder
   zusammengesetzt und exportiert. Szenen lassen sich einzeln ausnehmen; Stabilisierung und Flacker-Korrektur arbeiten szenenweise.
+* **Stabilisierung 2.0**: Verschiebung, Kippen/Drehen (Vision-Homographie) und Rolling-Shutter-Schräglage bei schnellen Schwenks.
+* **Bildfehler**: Verzeichnung (Weitwinkel/Actioncam), Randabdunklung, Banding (Dither), Zeilensprung – teils mit Erkennung.
+* **Hochformat/Quadrat**: automatischer Bildausschnitt (9:16, 4:5, 1:1) mit Verfolgung der Hauptperson (Vision), auch für gedrehte Handyvideos.
+* **Sprache** (optionales Whisper-Modell): Transkription mit Wort-Zeitstempeln, SRT-Export, Untertitel einbrennen, Pausen und Füllwörter automatisch kürzen.
+* **Live-Vorschau mit Wiedergabe**: Vorher/Nachher-Schieber während des Abspielens, optional mit bearbeitetem Ton.
+* **Stapelverarbeitung**: mehrere Videos nacheinander (automatisch oder mit denselben Einstellungen/Look).
 * **Audio**: spektrale Rauschminderung (Wiener-Filter mit Rauschprofil), Brummfilter, Sprach-Erkennung für
   „Stimme in den Vordergrund", Klarheits-EQ, Kompression, EBU-R128-Normalisierung, True-Peak-Limiter.
 
@@ -41,6 +47,17 @@ Benötigt nur Swift 5.9+ (Command Line Tools genügen, Xcode ist nicht nötig).
 | KI: Hochskalierung | **Real-ESRGAN x4v3** (Core ML, kachelweise) – langsam: ca. 0,65 s pro 540p-Frame |
 
 Headless-Test: `.build/release/VideoToolkit --cli selftest | analyze <datei> | fix <ein> <aus>`.
+
+## Optionale große Modelle
+
+Whisper (~630 MB) und Demucs (~410 MB) werden nicht mit der App ausgeliefert. Einmalig laden und neu bauen:
+
+```bash
+Scripts/fetch_models.sh all      # oder: whisper | demucs
+Scripts/build_app.sh
+```
+
+Alternativ die Modellordner in der App über „Modell importieren …“ auswählen. Lizenzhinweise: [Models/NOTICE.md](Models/NOTICE.md).
 
 ## KI-Modelle (lokal, eingebettet)
 

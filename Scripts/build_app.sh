@@ -10,6 +10,8 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/VideoToolkit "$APP/Contents/MacOS/VideoToolkit"
 cp -R Models "$APP/Contents/Resources/Models"
+# Große optionale Modelle (Whisper, Demucs) nur einbetten, wenn sie vorhanden sind; für Veröffentlichungen: VT_NO_OPTIONAL=1
+if [ "${VT_NO_OPTIONAL:-0}" = "1" ]; then rm -rf "$APP/Contents/Resources/Models/Optional"; fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
 ICONSET="$(mktemp -d)/AppIcon.iconset"
