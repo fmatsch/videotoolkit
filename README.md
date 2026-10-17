@@ -22,6 +22,9 @@ Benötigt nur Swift 5.9+ (Command Line Tools genügen, Xcode ist nicht nötig).
 * **Experten-Modus**: alle Parameter (Licht, Farbe, Entrauschen, Schärfen, Stabilisierung, Flackern, Upscaling,
   Rauschminderung, Stimmen-Fokus, De-Esser, Kompressor, Lautheit, 5-Band-EQ), Vorher/Nachher-Schieber, Probehören.
 * **Referenzbild**: Farben und Tonwerte des Videos werden per Histogramm-Matching (3D-LUT) an ein Bild angeglichen.
+* **Szenen-Angleich**: Das Video wird an den Schnitten in Szenen getrennt (automatische Schnitterkennung), jede Szene
+  wird an ein Referenzbild aus dem Video (oder aus einer Datei) angeglichen und alles wird in einem Durchlauf wieder
+  zusammengesetzt und exportiert. Szenen lassen sich einzeln ausnehmen; Stabilisierung und Flacker-Korrektur arbeiten szenenweise.
 * **Audio**: spektrale Rauschminderung (Wiener-Filter mit Rauschprofil), Brummfilter, Sprach-Erkennung für
   „Stimme in den Vordergrund", Klarheits-EQ, Kompression, EBU-R128-Normalisierung, True-Peak-Limiter.
 

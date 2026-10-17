@@ -2,12 +2,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum InspectorTab: String, CaseIterable, Identifiable {
-    case diagnose = "Diagnose", video = "Video", audio = "Audio", reference = "Referenz", export = "Export"
+    case diagnose = "Diagnose", video = "Video", audio = "Audio", scenes = "Szenen", reference = "Referenz", export = "Export"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .diagnose: "stethoscope"; case .video: "film"; case .audio: "waveform"
-        case .reference: "photo"; case .export: "square.and.arrow.up"
+        case .scenes: "rectangle.split.3x1"; case .reference: "photo"; case .export: "square.and.arrow.up"
         }
     }
 }
@@ -18,7 +18,7 @@ struct ContentView: View {
     @LocalState private var dropTargeted = false
 
     var tabs: [InspectorTab] {
-        project.expertMode ? InspectorTab.allCases : [.diagnose, .reference, .export]
+        project.expertMode ? InspectorTab.allCases : [.diagnose, .scenes, .reference, .export]
     }
 
     var body: some View {
@@ -76,6 +76,7 @@ struct ContentView: View {
             case .diagnose: DiagnoseTab()
             case .video: VideoTab()
             case .audio: AudioTab()
+            case .scenes: ScenesTab()
             case .reference: ReferenceTab()
             case .export: ExportTab()
             }

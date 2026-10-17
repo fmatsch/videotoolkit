@@ -55,7 +55,8 @@ struct ExportTab: View {
             if v.deflicker { items.append("Flacker-Korrektur") }
             if v.denoiseSpatial > 0 || v.denoiseTemporal > 0 { items.append("Entrauschen") }
             if v.upscale > 1 { items.append("Hochskalierung \(v.upscale)×") }
-            if v.referenceStrength > 0 && project.referenceImage != nil { items.append("Referenz-Look") }
+            if v.referenceStrength > 0 && project.referenceImage != nil && !project.sceneMode { items.append("Referenz-Look") }
+            if project.sceneMode && project.sceneReference != nil { items.append("Szenen-Angleich (\(project.scenes.filter(\.enabled).count) Szenen)") }
             if v.exposure != 0 || v.shadows != 0 || v.highlights != 0 || v.contrast != 1 || v.temperature != 0 || v.saturation != 1 { items.append("Licht & Farbe") }
             if v.sharpen > 0 { items.append("Schärfen") }
         }

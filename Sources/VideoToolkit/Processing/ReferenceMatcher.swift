@@ -4,6 +4,11 @@ import Accelerate
 
 /// Gleicht die Tonwert- und Farbverteilung des Videos an ein Referenzbild an
 /// (Histogramm-Matching pro Kanal, dann als 3D-LUT).
+enum MatchMode: String, CaseIterable, Identifiable {
+    case soft = "Sanft (Farbe & Helligkeit)", full = "Voll (Histogramm)"
+    var id: String { rawValue }
+}
+
 enum ReferenceMatcher {
     /// Normalisierte kumulative Verteilung pro Kanal (3 × 256) aus einem Bild.
     static func cdf(of cg: CGImage) -> [[Double]] {
@@ -25,8 +30,28 @@ enum ReferenceMatcher {
     }
 
     /// Kurven, die die Quellverteilung auf die Referenzverteilung abbilden.
-    static func match(source: [[Double]], reference: [[Double]]) -> [[Float]] {
+    /// Mittelwert und Streuung (0...1) einer kumulativen Verteilung.
+    static func moments(_ cdf: [Double]) -> (mean: Double, std: Double) {
+        var mean = 0.0, prev = 0.0
+        var pdf = [Double](repeating: 0, count: 256)
+        for i in 0..<256 { pdf[i] = cdf[i] - prev; prev = cdf[i]; mean += pdf[i] * Double(i) / 255 }
+        var v = 0.0
+        for i in 0..<256 { v += pdf[i] * pow(Double(i) / 255 - mean, 2) }
+        return (mean, v.squareRoot())
+    }
+
+    static func match(source: [[Double]], reference: [[Double]], mode: MatchMode = .full) -> [[Float]] {
         var curves: [[Float]] = []
+        if mode == .soft {
+            for c in 0..<3 {
+                let s = moments(source[c]), r = moments(reference[c])
+                let gain = min(1.6, max(0.6, r.std / max(s.std, 0.02)))
+                curves.append((0..<256).map { i in
+                    Float(min(1, max(0, r.mean + (Double(i) / 255 - s.mean) * gain)))
+                })
+            }
+            return curves
+        }
         for c in 0..<3 {
             var map = [Float](repeating: 0, count: 256)
             var j = 0
@@ -50,7 +75,7 @@ enum ReferenceMatcher {
     }
 
     /// Erzeugt das LUT, indem die Beispielbilder durch die Vor-Referenz-Kette geschickt werden.
-    static func makeLUT(samples: [CGImage], settings: VideoSettings, reference: CGImage, context: CIContext) -> ColorLUT? {
+    static func makeLUT(samples: [CGImage], settings: VideoSettings, reference: CGImage, context: CIContext, mode: MatchMode = .full) -> ColorLUT? {
         guard !samples.isEmpty else { return nil }
         var pre = settings
         pre.referenceStrength = 0
@@ -63,6 +88,6 @@ enum ReferenceMatcher {
         guard !cdfs.isEmpty else { return nil }
         let src = average(cdfs)
         let ref = cdf(of: reference)
-        return ColorLUT(curves: match(source: src, reference: ref))
+        return ColorLUT(curves: match(source: src, reference: ref, mode: mode))
     }
 }

@@ -43,6 +43,22 @@ final class Project: ObservableObject {
     private var lut: ColorLUT?
     private var lutTask: Task<Void, Never>?
 
+    // Szenen-Modus: Schnitterkennung → Szenen einzeln an ein Referenzbild angleichen → wieder zusammensetzen
+    @Published var sceneMode = false {
+        didSet { if sceneMode && scenes.isEmpty && sceneProgress == nil { detectScenes() } else { schedulePreview() } }
+    }
+    @Published var scenes: [VideoScene] = [] { didSet { schedulePreview() } }
+    @Published var sceneSensitivity = 0.5
+    @Published var sceneReference: CGImage?
+    @Published var sceneReferenceLabel: String?
+    @Published var sceneReferenceSceneID: Int?
+    @Published var sceneMatchStrength = 0.85 { didSet { schedulePreview() } }
+    @Published var sceneMatchMode: MatchMode = .full { didSet { if oldValue != sceneMatchMode { rebuildSceneLUTs() } } }
+    @Published var sceneProgress: (Double, String)?
+    private var sceneCutFrames: Set<Int> = []
+    private var sceneTask: Task<Void, Never>?
+    private var sceneLUTTask: Task<Void, Never>?
+
     // Vorschau
     @Published var previewTime: Double = 0 { didSet { schedulePreview() } }
     @Published var beforeImage: CGImage?
@@ -72,7 +88,9 @@ final class Project: ObservableObject {
 
     func open(_ url: URL) {
         stopAudio()
-        exportTask?.cancel(); previewTask?.cancel(); lutTask?.cancel()
+        exportTask?.cancel(); previewTask?.cancel(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
+        sceneMode = false; scenes = []; sceneReference = nil; sceneReferenceLabel = nil; sceneReferenceSceneID = nil
+        sceneProgress = nil; sceneCutFrames = []
         self.url = url
         errorMessage = nil
         lastExport = nil
@@ -154,6 +172,90 @@ final class Project: ObservableObject {
     func resetVideo() { let r = video.referenceStrength; video = VideoSettings(); video.referenceStrength = r }
     func resetAudio() { audio = AudioSettings() }
 
+    // MARK: Szenen
+
+    func sceneIndex(at time: Double) -> Int? {
+        guard !scenes.isEmpty else { return nil }
+        return scenes.lastIndex { $0.start <= time + 1e-4 } ?? 0
+    }
+
+    func detectScenes() {
+        guard let asset, hasVideo, let renderer else { return }
+        sceneTask?.cancel()
+        sceneProgress = (0, "Schnitte suchen …")
+        let sens = sceneSensitivity, dur = duration
+        sceneTask = Task {
+            do {
+                let r = try await SceneDetector.detect(asset: asset, sensitivity: sens) { [weak self] p in
+                    Task { @MainActor in self?.sceneProgress = (p * 0.5, "Schnitte suchen …") }
+                }
+                var list = SceneDetector.scenes(from: r, duration: dur)
+                for i in list.indices {
+                    try Task.checkCancellation()
+                    let sc = list[i], span = max(sc.end - sc.start, 0.05)
+                    var imgs: [CGImage] = []
+                    for f in [0.2, 0.5, 0.8] {
+                        let t = min(max(sc.start + max(span * f, 0.1), sc.start), max(sc.start, dur - 0.05))
+                        if let cg = await renderer.frame(at: t), let small = VideoAnalyzer.scaled(cg, width: 640) { imgs.append(small) }
+                    }
+                    list[i].samples = imgs
+                    list[i].thumbnail = imgs.count > 1 ? VideoAnalyzer.scaled(imgs[1], width: 200) : imgs.first.flatMap { VideoAnalyzer.scaled($0, width: 200) }
+                    sceneProgress = (0.5 + 0.5 * Double(i + 1) / Double(list.count), "Szenen vorbereiten …")
+                }
+                sceneCutFrames = Set(r.cutFrames)
+                videoAnalysis?.motion?.cuts.formUnion(sceneCutFrames)
+                stabCache = nil; gainsCache = nil
+                scenes = list
+                sceneProgress = nil
+                rebuildSceneLUTs()
+            } catch is CancellationError {
+            } catch {
+                errorMessage = error.localizedDescription
+                sceneProgress = nil
+            }
+        }
+    }
+
+    /// Das aktuell angezeigte Bild als Referenz für alle Szenen verwenden.
+    func useCurrentFrameAsSceneReference() {
+        guard let renderer else { return }
+        let t = previewTime
+        Task {
+            guard let frame = await renderer.frame(at: t) else { return }
+            sceneReference = frame
+            sceneReferenceLabel = "Bild bei \(Project.format(t))"
+            sceneReferenceSceneID = sceneIndex(at: t)
+            rebuildSceneLUTs()
+        }
+    }
+
+    func useImageFileAsSceneReference(_ url: URL) {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            errorMessage = "Das Referenzbild konnte nicht geladen werden."; return
+        }
+        sceneReference = img
+        sceneReferenceLabel = url.lastPathComponent
+        sceneReferenceSceneID = nil
+        rebuildSceneLUTs()
+    }
+
+    func rebuildSceneLUTs() {
+        guard let ref = sceneReference, let renderer, !scenes.isEmpty else { return }
+        sceneLUTTask?.cancel()
+        sceneProgress = (0, "Szenen angleichen …")
+        let list = scenes, mode = sceneMatchMode, ctx = renderer.context
+        sceneLUTTask = Task {
+            let luts: [ColorLUT?] = await Task.detached(priority: .userInitiated) {
+                list.map { ReferenceMatcher.makeLUT(samples: $0.samples, settings: VideoSettings(), reference: ref, context: ctx, mode: mode) }
+            }.value
+            guard !Task.isCancelled, luts.count == scenes.count else { return }
+            var updated = scenes
+            for i in updated.indices { updated[i].lut = luts[i] }
+            scenes = updated
+            sceneProgress = nil
+        }
+    }
+
     // MARK: Referenz
 
     func loadReference(_ url: URL) {
@@ -202,7 +304,13 @@ final class Project: ObservableObject {
     func schedulePreview(immediately: Bool = false) {
         guard state == .ready || immediately, let renderer else { return }
         previewTask?.cancel()
-        let t = previewTime, settings = video, lut = lut
+        let t = previewTime
+        var settings = video, lut = lut
+        if sceneMode, let idx = sceneIndex(at: t), sceneReference != nil {
+            let sc = scenes[idx]
+            settings = video.sceneAdjusted(strength: sceneMatchStrength, applyMatch: sc.enabled && sc.lut != nil)
+            lut = sc.lut
+        }
         let params = frameParams(at: t, settings: settings)
         let cached = currentFrame
         previewTask = Task {
@@ -298,12 +406,15 @@ final class Project: ObservableObject {
         stopAudio()
         let v = video, a = audio, noise = audioAnalysis?.noiseProfile, motion = videoAnalysis?.motion
         let lut = lut, opts = exportOptions
+        let renders: [SceneRender] = (sceneMode && sceneReference != nil)
+            ? scenes.map { SceneRender(start: $0.start, enabled: $0.enabled, lut: $0.lut, strength: sceneMatchStrength) } : []
+        let cuts = sceneMode ? sceneCutFrames : []
         state = .exporting(0, "Starten …")
         lastExport = nil
         exportTask = Task {
             do {
                 try await Exporter.export(asset: asset, video: v, audio: a, noise: noise, motion: motion, lut: lut,
-                                          options: opts, to: dest) { [weak self] p, text in
+                                          options: opts, to: dest, scenes: renders, sceneCuts: cuts) { [weak self] p, text in
                     Task { @MainActor in self?.state = .exporting(p, text) }
                 }
                 lastExport = dest

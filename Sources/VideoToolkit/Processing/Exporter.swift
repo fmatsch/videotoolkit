@@ -23,6 +23,7 @@ struct ExportError: LocalizedError {
 enum Exporter {
     static func export(asset: AVURLAsset, video: VideoSettings, audio: AudioSettings, noise: NoiseProfile?,
                        motion: MotionData?, lut: ColorLUT?, options: ExportOptions, to url: URL,
+                       scenes: [SceneRender] = [], sceneCuts: Set<Int> = [],
                        progress: @escaping (Double, String) -> Void) async throws {
         guard let vTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw ExportError(message: "Keine Videospur gefunden.")
@@ -41,6 +42,7 @@ enum Exporter {
             progress(0, "Bewegung analysieren …")
             motionData = try await MotionPass.run(asset: asset, maxSeconds: nil) { progress(0.2 * $0, "Bewegung analysieren …") }
         }
+        motionData?.cuts.formUnion(sceneCuts)
         var offsets: [CGPoint] = [], zoom: CGFloat = 1, gains: [Float] = []
         if let m = motionData {
             if vs.stabilize {
@@ -165,6 +167,7 @@ enum Exporter {
         var aiSrc: CVPixelBuffer?
         let upscaler: AIUpscaler? = (vs.aiUpscale && vs.upscale > 1.01 && AIModels.upscalerAvailable) ? try await AIUpscaler.load() : nil
         var frameIndex = 0
+        var sceneIdx = 0
         let baseProgress = (vs.stabilize || vs.deflicker) ? 0.3 : 0.1
 
         do {
@@ -182,6 +185,15 @@ enum Exporter {
                 }
                 if frameIndex < gains.count { params.flickerGain = gains[frameIndex] }
 
+                // Szenen-Modus: Look der aktuellen Szene (Angleich an das Referenzbild)
+                var fs = vs
+                var frameLUT = lut
+                if !scenes.isEmpty {
+                    while sceneIdx + 1 < scenes.count, pts.seconds >= scenes[sceneIdx + 1].start - 1e-4 { sceneIdx += 1 }
+                    let sc = scenes[sceneIdx]
+                    fs = vs.sceneAdjusted(strength: sc.strength, applyMatch: sc.enabled && sc.lut != nil)
+                    frameLUT = sc.lut
+                }
                 var img = FilterChain.stage1(CIImage(cvPixelBuffer: pb), vs, params)
                 if vs.denoiseTemporal > 0 {
                     let mixed = FilterChain.temporal(img, previous: prevTemporal, strength: vs.denoiseTemporal)
@@ -202,10 +214,10 @@ enum Exporter {
                         prevTemporal = nil
                     }
                 }
-                img = FilterChain.color(img, vs)
+                img = FilterChain.color(img, fs)
                 if let ai = upscaler {
                     // KI-Hochskalierung: Farbe + Referenz anwenden, in Puffer rendern, 4× hochrechnen, auf Zielgröße skalieren
-                    let base = FilterChain.applyLUT(img, vs, lut: lut)
+                    let base = FilterChain.applyLUT(img, fs, lut: frameLUT)
                     if aiSrc == nil {
                         CVPixelBufferCreate(nil, Int(rect.width), Int(rect.height), kCVPixelFormatType_32BGRA,
                                             [kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &aiSrc)
@@ -216,7 +228,7 @@ enum Exporter {
                     let bigImg = CIImage(cvPixelBuffer: big, options: [.colorSpace: FilterChain.colorSpace])
                     img = FilterChain.scaleSharpen(bigImg, vs, scale: CGFloat(vs.upscale) / 4)
                 } else {
-                    img = FilterChain.finish(img, vs, lut: lut, scale: CGFloat(vs.upscale))
+                    img = FilterChain.finish(img, fs, lut: frameLUT, scale: CGFloat(vs.upscale))
                 }
 
                 guard let pool = adaptor.pixelBufferPool else { throw ExportError(message: "Kein Pixelpuffer-Pool.") }

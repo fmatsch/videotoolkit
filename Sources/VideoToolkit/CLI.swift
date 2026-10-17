@@ -44,6 +44,12 @@ enum CLI {
                     if i == 1, let cg = r.context.createCGImage(CIImage(cvPixelBuffer: big), from: CIImage(cvPixelBuffer: big).extent) { save(cg, args[2]) }
                 }
                 return 0
+            case "scenes":
+                let asset = AVURLAsset(url: URL(fileURLWithPath: args[1]))
+                let r = try await SceneDetector.detect(asset: asset, sensitivity: Double(args.count > 2 ? args[2] : "0.5") ?? 0.5) { _ in }
+                let dur = try await asset.load(.duration).seconds
+                for sc in SceneDetector.scenes(from: r, duration: dur) { print(String(format: "Szene %d: %.2f – %.2f s (Frame %d)", sc.id + 1, sc.start, sc.end, sc.startFrame)) }
+                return 0
             case "selftest": return SelfTest.run() ? 0 : 1
             case "analyze":
                 let (va, aa) = try await analyze(URL(fileURLWithPath: args[1]))
@@ -62,6 +68,25 @@ enum CLI {
                     v.denoiseSpatial = 0.6; v.denoiseTemporal = 0.8; v.sharpen = 1; v.upscale = 2; v.aiUpscale = AIModels.upscalerAvailable
                 }
                 var lut: ColorLUT?
+                var sceneRenders: [SceneRender] = [], sceneCuts: Set<Int> = []
+                if let si = args.firstIndex(of: "--scene-ref"), let refT = Double(args[si + 1]) {
+                    // Szenen-Modus: Referenz = Bild bei refT
+                    let r = try await SceneDetector.detect(asset: asset, sensitivity: 0.5) { _ in }
+                    let dur = try await asset.load(.duration).seconds
+                    var list = SceneDetector.scenes(from: r, duration: dur)
+                    let pr = PreviewRenderer(asset: asset)
+                    guard let ref = await pr.frame(at: refT) else { return 1 }
+                    for i in list.indices {
+                        let span = list[i].end - list[i].start
+                        for f in [0.2, 0.5, 0.8] {
+                            if let cg = await pr.frame(at: list[i].start + max(span * f, 0.1)), let sm = VideoAnalyzer.scaled(cg, width: 640) { list[i].samples.append(sm) }
+                        }
+                        list[i].lut = ReferenceMatcher.makeLUT(samples: list[i].samples, settings: VideoSettings(), reference: ref, context: pr.context, mode: args.contains("--full") ? .full : .soft)
+                    }
+                    sceneRenders = list.map { SceneRender(start: $0.start, enabled: true, lut: $0.lut, strength: 0.85) }
+                    sceneCuts = Set(r.cutFrames)
+                    print("Szenen:", list.count, "Schnitte bei Frames", r.cutFrames)
+                }
                 if let ri = args.firstIndex(of: "--reference"), let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[ri + 1]) as CFURL, nil),
                    let ref = CGImageSourceCreateImageAtIndex(src, 0, nil), let samples = va?.samples {
                     v.referenceStrength = 0.8
@@ -74,7 +99,7 @@ enum CLI {
                 var last = -1
                 let t0 = Date()
                 try await Exporter.export(asset: asset, video: v, audio: a, noise: aa?.noiseProfile, motion: va?.motion,
-                                          lut: lut, options: opts, to: output) { p, text in
+                                          lut: lut, options: opts, to: output, scenes: sceneRenders, sceneCuts: sceneCuts) { p, text in
                     let pc = Int(p * 100)
                     if pc != last && pc % 10 == 0 { last = pc; print("  \(pc) % \(text)") }
                 }
