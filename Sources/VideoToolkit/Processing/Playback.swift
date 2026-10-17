@@ -248,6 +248,7 @@ final class PlaybackController: ObservableObject {
         audioStatus = "Ton wird berechnet …"
         audioTask = Task {
             do {
+                await AIModels.prepare(audio: settings)
                 guard let pcm = try await AudioIO.read(asset: asset) else { audioStatus = nil; return }
                 let out = await Task.detached(priority: .userInitiated) { AudioProcessor.process(pcm, settings: settings, noise: noise) }.value
                 guard !Task.isCancelled else { return }

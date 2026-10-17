@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import AppKit
 import ImageIO
+import Accelerate
 import Vision
 import simd
 import CoreImage
@@ -105,6 +106,36 @@ enum CLI {
                 print(String(format: "verarbeitet in %.2f s", Date().timeIntervalSince(t0)))
                 try AudioIO.writeWAV(out, to: URL(fileURLWithPath: args[2]))
                 return 0
+            case "transcribe":
+                // transcribe <in> [sprache]
+                guard let pcm = try await AudioIO.read(asset: AVURLAsset(url: URL(fileURLWithPath: args[1]))) else { return 1 }
+                let samples = Resampler.resample(pcm.mono, from: pcm.sampleRate, to: 16_000)
+                let t0 = Date()
+                let t = try await Transcriber().transcribe(samples: samples, duration: pcm.duration, language: args.count > 2 ? args[2] : "auto") { p in print(String(format: "  %.0f %%", p * 100)) }
+                print(String(format: "Transkription in %.1f s (%@)", Date().timeIntervalSince(t0), t.language))
+                for s in t.segments { print(String(format: "[%.2f–%.2f] %@", s.start, s.end, s.text)) }
+                var st = SpeechSettings(); st.cutPauses = true; st.removeFillers = true
+                let removed = SpeechEditor.removedRanges(t, settings: st, duration: pcm.duration, mono: pcm.mono, sampleRate: pcm.sampleRate)
+                print("Zu entfernen:", removed.map { String(format: "%.2f–%.2f", $0.start, $0.end) }.joined(separator: ", "))
+                print(SpeechEditor.srt(SpeechEditor.cues(from: t), removed: removed))
+                return 0
+            case "demucs":
+                // demucs <in> <out-prefix>: trennt Stimme/Rest, prüft die Rekonstruktion (Stimme + Rest ≈ Original)
+                guard let pcm = try await AudioIO.read(asset: AVURLAsset(url: URL(fileURLWithPath: args[1])), duration: Double(args.count > 3 ? args[3] : "30") ?? 30) else { return 1 }
+                try await DemucsSeparator.prepare()
+                guard let sep = DemucsSeparator.shared else { print("Modell fehlt"); return 1 }
+                let L = Resampler.resample(pcm.channels[0], from: pcm.sampleRate, to: 44_100)
+                let R = pcm.channels.count > 1 ? Resampler.resample(pcm.channels[1], from: pcm.sampleRate, to: 44_100) : L
+                let t0 = Date()
+                let st = try sep.separate(stereo: [L, R]) { print(String(format: "  %.0f %%", $0 * 100)) }
+                print(String(format: "Trennung %.1f s Audio in %.1f s", Double(L.count) / 44_100, Date().timeIntervalSince(t0)))
+                func rms(_ x: [Float]) -> Float { var r: Float = 0; vDSP_rmsqv(x, 1, &r, vDSP_Length(x.count)); return r }
+                var err = [Float](repeating: 0, count: L.count)
+                for i in 0..<L.count { err[i] = L[i] - (st.vocals[0][i] + st.rest[0][i]) }
+                print(String(format: "Original %.1f dB | Stimme %.1f dB | Rest %.1f dB | Rekonstruktionsfehler %.1f dB", toDB(rms(L)), toDB(rms(st.vocals[0])), toDB(rms(st.rest[0])), toDB(rms(err))))
+                try AudioIO.writeWAV(PCMAudio(channels: st.vocals, sampleRate: 44_100), to: URL(fileURLWithPath: args[2] + "-vocals.wav"))
+                try AudioIO.writeWAV(PCMAudio(channels: st.rest, sampleRate: 44_100), to: URL(fileURLWithPath: args[2] + "-rest.wav"))
+                return 0
             case "selftest": return SelfTest.run() ? 0 : 1
             case "analyze":
                 let (va, aa) = try await analyze(URL(fileURLWithPath: args[1]))
@@ -131,6 +162,17 @@ enum CLI {
                     v.denoiseSpatial = 0.6; v.denoiseTemporal = 0.8; v.sharpen = 1; v.upscale = 2; v.aiUpscale = AIModels.upscalerAvailable
                 }
                 var lut: ColorLUT?
+                var removed: [TimeRange] = [], burnCues: [Cue] = []
+                if args.contains("--cut") || args.contains("--fillers") || args.contains("--burn") {
+                    guard let pcm = try await AudioIO.read(asset: asset) else { return 1 }
+                    let samples = Resampler.resample(pcm.mono, from: pcm.sampleRate, to: 16_000)
+                    let tr = try await Transcriber().transcribe(samples: samples, duration: pcm.duration, language: "auto") { _ in }
+                    var st = SpeechSettings(); st.cutPauses = args.contains("--cut"); st.removeFillers = args.contains("--fillers")
+                    removed = SpeechEditor.removedRanges(tr, settings: st, duration: pcm.duration, mono: pcm.mono, sampleRate: pcm.sampleRate)
+                    if args.contains("--burn") { burnCues = SpeechEditor.cues(from: tr) }
+                    print("Schnitte:", removed.count, String(format: "%.1f s entfernt", removed.reduce(0) { $0 + $1.length }), "| Untertitel:", burnCues.count)
+                    if let i = args.firstIndex(of: "--srt") { try? SpeechEditor.srt(SpeechEditor.cues(from: tr), removed: removed).write(toFile: args[i + 1], atomically: true, encoding: .utf8) }
+                }
                 var sceneRenders: [SceneRender] = [], sceneCuts: Set<Int> = []
                 if let si = args.firstIndex(of: "--scene-ref"), let refT = Double(args[si + 1]) {
                     // Szenen-Modus: Referenz = Bild bei refT
@@ -162,7 +204,7 @@ enum CLI {
                 var last = -1
                 let t0 = Date()
                 try await Exporter.export(asset: asset, video: v, audio: a, noise: aa?.noiseProfile, motion: va?.motion,
-                                          lut: lut, options: opts, to: output, scenes: sceneRenders, sceneCuts: sceneCuts) { p, text in
+                                          lut: lut, options: opts, to: output, scenes: sceneRenders, sceneCuts: sceneCuts, removed: removed, cues: burnCues) { p, text in
                     let pc = Int(p * 100)
                     if pc != last && pc % 10 == 0 { last = pc; print("  \(pc) % \(text)") }
                 }

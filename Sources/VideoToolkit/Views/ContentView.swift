@@ -2,12 +2,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum InspectorTab: String, CaseIterable, Identifiable {
-    case diagnose = "Diagnose", video = "Video", audio = "Audio", scenes = "Szenen", reference = "Referenz", export = "Export"
+    case diagnose = "Diagnose", video = "Video", audio = "Audio", speech = "Sprache", scenes = "Szenen", reference = "Referenz", export = "Export"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .diagnose: "stethoscope"; case .video: "film"; case .audio: "waveform"
-        case .scenes: "rectangle.split.3x1"; case .reference: "photo"; case .export: "square.and.arrow.up"
+        case .speech: "text.bubble"; case .scenes: "rectangle.split.3x1"; case .reference: "photo"; case .export: "square.and.arrow.up"
         }
     }
 }
@@ -16,9 +16,10 @@ struct ContentView: View {
     @EnvironmentObject var project: Project
     @LocalState private var tab: InspectorTab = .diagnose
     @LocalState private var dropTargeted = false
+    @LocalState private var showBatch = false
 
     var tabs: [InspectorTab] {
-        project.expertMode ? InspectorTab.allCases : [.diagnose, .scenes, .reference, .export]
+        project.expertMode ? InspectorTab.allCases : [.diagnose, .speech, .scenes, .reference, .export]
     }
 
     var body: some View {
@@ -41,6 +42,10 @@ struct ContentView: View {
                 Text(project.url?.lastPathComponent ?? "Video Toolkit").font(.headline)
             }
             ToolbarItem(placement: .primaryAction) {
+                Button { showBatch = true } label: { Label("Stapel", systemImage: "square.stack.3d.down.right") }
+                    .help("Mehrere Videos nacheinander verarbeiten")
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Picker("Modus", selection: $project.expertMode) {
                     Text("Einfach").tag(false); Text("Experte").tag(true)
                 }.pickerStyle(.segmented).help("Experten-Modus: alle Einstellungen selbst anpassen")
@@ -61,6 +66,7 @@ struct ContentView: View {
             Button("OK") { project.errorMessage = nil }
         } message: { Text(project.errorMessage ?? "") }
         .onReceive(NotificationCenter.default.publisher(for: .openVideoRequested)) { _ in open() }
+        .sheet(isPresented: $showBatch) { BatchView(queue: project.batch).environmentObject(project) }
     }
 
     private func open() { if let u = FilePanels.openVideo() { project.open(u) } }
@@ -76,6 +82,7 @@ struct ContentView: View {
             case .diagnose: DiagnoseTab()
             case .video: VideoTab()
             case .audio: AudioTab()
+            case .speech: SpeechTab()
             case .scenes: ScenesTab()
             case .reference: ReferenceTab()
             case .export: ExportTab()

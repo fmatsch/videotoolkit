@@ -46,6 +46,16 @@ final class Project: ObservableObject {
     private var lut: ColorLUT?
     private var lutTask: Task<Void, Never>?
 
+    // Sprache: Transkription (Whisper), Pausenschnitt, Untertitel
+    @Published var speech = SpeechSettings() { didSet { updateRemoved() } }
+    @Published var transcript: Transcript?
+    @Published var transcribing: (Double, String)?
+    @Published var removedRanges: [TimeRange] = []
+    @Published var cues: [Cue] = []
+    private let transcriber = Transcriber()
+    private var transcribeTask: Task<Void, Never>?
+    var removedSeconds: Double { removedRanges.reduce(0) { $0 + $1.length } }
+
     // Szenen-Modus: Schnitterkennung → Szenen einzeln an ein Referenzbild angleichen → wieder zusammensetzen
     @Published var sceneMode = false {
         didSet { if sceneMode && scenes.isEmpty && sceneProgress == nil { detectScenes() } else { schedulePreview() } }
@@ -67,6 +77,7 @@ final class Project: ObservableObject {
     @Published var compare: CompareMode = .split { didSet { schedulePreview() } }
     @Published var splitFraction: CGFloat = 0.5 { didSet { schedulePreview() } }
     let playback = PlaybackController()
+    let batch = BatchQueue()
     private var playbackSink: AnyCancellable?
     private var fullMotionTask: Task<Void, Never>?
     private var reframeCenters: [CGPoint] = []
@@ -97,7 +108,7 @@ final class Project: ObservableObject {
 
     func open(_ url: URL) {
         stopAudio()
-        exportTask?.cancel(); fullMotionTask?.cancel(); trackingTask?.cancel(); reframeCenters = []; trackingTask = nil; playback.stop(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
+        exportTask?.cancel(); transcribeTask?.cancel(); transcript = nil; transcribing = nil; removedRanges = []; cues = []; speech = SpeechSettings(); fullMotionTask?.cancel(); trackingTask?.cancel(); reframeCenters = []; trackingTask = nil; playback.stop(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
         sceneMode = false; scenes = []; sceneReference = nil; sceneReferenceLabel = nil; sceneReferenceSceneID = nil
         sceneProgress = nil; sceneCutFrames = []
         self.url = url
@@ -182,6 +193,50 @@ final class Project: ObservableObject {
 
     func resetVideo() { let r = video.referenceStrength; video = VideoSettings(); video.referenceStrength = r }
     func resetAudio() { audio = AudioSettings() }
+
+    // MARK: Sprache
+
+    func transcribe() {
+        guard let asset, hasAudio else { return }
+        guard Transcriber.isAvailable else { errorMessage = "Das Whisper-Modell fehlt. Lade es mit Scripts/fetch_models.sh whisper oder importiere es im Tab „Sprache“."; return }
+        transcribeTask?.cancel()
+        transcribing = (0, "Audio vorbereiten …")
+        let lang = speech.language, dur = duration
+        transcribeTask = Task {
+            do {
+                guard let pcm = try await AudioIO.read(asset: asset) else { transcribing = nil; return }
+                let samples = await Task.detached(priority: .userInitiated) { Resampler.resample(pcm.mono, from: pcm.sampleRate, to: 16_000) }.value
+                transcribing = (0.02, "Modell wird geladen (beim ersten Mal dauert das einige Minuten) …")
+                let t = try await transcriber.transcribe(samples: samples, duration: dur, language: lang) { [weak self] p in
+                    Task { @MainActor in self?.transcribing = (0.05 + 0.95 * p, "Sprache wird erkannt …") }
+                }
+                guard !Task.isCancelled else { return }
+                transcript = t
+                cues = SpeechEditor.cues(from: t)
+                updateRemoved()
+                transcribing = nil
+            } catch is CancellationError {
+                transcribing = nil
+            } catch {
+                transcribing = nil
+                errorMessage = "Transkription fehlgeschlagen: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func cancelTranscribe() { transcribeTask?.cancel(); transcribing = nil }
+
+    /// Entfernte Bereiche (Pausen, Füllwörter) aus Transkript und Einstellungen berechnen.
+    func updateRemoved() {
+        guard let t = transcript else { removedRanges = []; return }
+        let s = speech, dur = duration
+        removedRanges = SpeechEditor.removedRanges(t, settings: s, duration: dur, mono: nil, sampleRate: 48_000)
+    }
+
+    func exportSRT(to url: URL) {
+        let text = SpeechEditor.srt(cues, removed: removedRanges)
+        do { try text.write(to: url, atomically: true, encoding: .utf8) } catch { errorMessage = error.localizedDescription }
+    }
 
     // MARK: Szenen
 
@@ -417,6 +472,7 @@ final class Project: ObservableObject {
         audioPreviewState = "Vorbereiten …"
         audioTask = Task {
             do {
+                await AIModels.prepare(audio: settings)
                 guard let pcm = try await AudioIO.read(asset: asset, start: start, duration: 12) else {
                     audioPreviewState = nil; return
                 }
@@ -459,12 +515,16 @@ final class Project: ObservableObject {
             ? scenes.map { SceneRender(start: $0.start, enabled: $0.enabled, lut: $0.lut, strength: sceneMatchStrength) } : []
         let cuts = sceneMode ? sceneCutFrames : []
         let centers = reframeCenters
+        let removed = removedRanges
+        let burnCues = speech.burnSubtitles ? cues : []
+        let scale = speech.subtitleScale
         state = .exporting(0, "Starten …")
         lastExport = nil
         exportTask = Task {
             do {
                 try await Exporter.export(asset: asset, video: v, audio: a, noise: noise, motion: motion, lut: lut,
-                                          options: opts, to: dest, scenes: renders, sceneCuts: cuts, reframeCenters: centers) { [weak self] p, text in
+                                          options: opts, to: dest, scenes: renders, sceneCuts: cuts, reframeCenters: centers,
+                                          removed: removed, cues: burnCues, subtitleScale: scale) { [weak self] p, text in
                     Task { @MainActor in self?.state = .exporting(p, text) }
                 }
                 lastExport = dest

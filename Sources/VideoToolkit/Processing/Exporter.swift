@@ -24,6 +24,7 @@ enum Exporter {
     static func export(asset: AVURLAsset, video: VideoSettings, audio: AudioSettings, noise: NoiseProfile?,
                        motion: MotionData?, lut: ColorLUT?, options: ExportOptions, to url: URL,
                        scenes: [SceneRender] = [], sceneCuts: Set<Int> = [], reframeCenters: [CGPoint] = [],
+                       removed: [TimeRange] = [], cues: [Cue] = [], subtitleScale: Double = 1,
                        progress: @escaping (Double, String) -> Void) async throws {
         guard let vTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw ExportError(message: "Keine Videospur gefunden.")
@@ -67,10 +68,14 @@ enum Exporter {
         var processedAudioURL: URL?
         var processedChannels = 2
         let hasAudio = !(try await asset.loadTracks(withMediaType: .audio)).isEmpty
-        if hasAudio, !aSet.isNeutral {
+        await AIModels.prepare(audio: aSet)
+        let cutting = !removed.isEmpty
+        let keep = SpeechEditor.keepRanges(removed: removed, duration: duration)
+        if hasAudio, !aSet.isNeutral || cutting {
             progress(0.2, "Audio verarbeiten …")
             if let pcm = try await AudioIO.read(asset: asset) {
-                let out = AudioProcessor.process(pcm, settings: aSet, noise: noise) { progress(0.2 + 0.1 * $0, "Audio verarbeiten …") }
+                var out = aSet.isNeutral ? pcm : AudioProcessor.process(pcm, settings: aSet, noise: noise) { progress(0.2 + 0.1 * $0, "Audio verarbeiten …") }
+                if cutting { out = AudioCutter.apply(out, keep: keep) }
                 let wav = tmp.appendingPathComponent("audio.wav")
                 try AudioIO.writeWAV(out, to: wav)
                 processedAudioURL = wav
@@ -176,6 +181,9 @@ enum Exporter {
         let outSize = CGSize(width: outW, height: outH)
         var frameIndex = 0
         var sceneIdx = 0
+        var keepIdx = 0, cueIdx = 0
+        var subtitles: SubtitleRenderer?
+        let rotated90 = abs(transform.b) > 0.01
         let baseProgress = (vs.stabilize || vs.deflicker || vs.rollingShutter > 0.001) ? 0.3 : 0.1
 
         do {
@@ -183,6 +191,13 @@ enum Exporter {
                 try Task.checkCancellation()
                 guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
                 let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+                let t = pts.seconds
+                if cutting {
+                    while keepIdx < keep.count, t >= keep[keepIdx].end - 1e-4 { keepIdx += 1 }
+                    if keepIdx >= keep.count { break }
+                    if t < keep[keepIdx].start - 1e-4 { frameIndex += 1; prevTemporal = nil; continue }
+                }
+                let outPTS = cutting ? CMTime(seconds: SpeechEditor.mapTime(t, removed: removed), preferredTimescale: 90_000) : pts
                 while !vIn.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
 
                 var params = FrameParams()
@@ -243,10 +258,30 @@ enum Exporter {
                     ctx.render(cropped, to: src, bounds: CGRect(x: 0, y: 0, width: geo.cropW, height: geo.cropH), colorSpace: FilterChain.colorSpace)
                     let big = try ai.upscale4x(src)
                     let bigImg = CIImage(cvPixelBuffer: big, options: [.colorSpace: FilterChain.colorSpace])
-                    img = FilterChain.dither(FilterChain.resizeSharpen(bigImg, vs, to: outSize), vs, offset: params.noiseOffset)
+                    img = FilterChain.resizeSharpen(bigImg, vs, to: outSize)
                 } else {
-                    img = FilterChain.dither(FilterChain.resizeSharpen(cropped, vs, to: outSize), vs, offset: params.noiseOffset)
+                    img = FilterChain.resizeSharpen(cropped, vs, to: outSize)
                 }
+                // Untertitel einbrennen (im Anzeigeformat gezeichnet, bei gedrehten Videos in Sensorlage zurückgedreht)
+                if !cues.isEmpty {
+                    while cueIdx < cues.count, cues[cueIdx].end < t { cueIdx += 1 }
+                    if cueIdx < cues.count, cues[cueIdx].start <= t {
+                        if subtitles == nil {
+                            subtitles = SubtitleRenderer(displaySize: rotated90 ? CGSize(width: outH, height: outW) : CGSize(width: outW, height: outH), scale: subtitleScale)
+                        }
+                        if var ov = subtitles?.overlay(for: cues[cueIdx].text) {
+                            if rotated90 {
+                                let m = transform.b > 0 ? CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: CGFloat(outW), ty: 0)      // Anzeige = Sensor 90° im Uhrzeigersinn
+                                                        : CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: CGFloat(outH))
+                                ov = ov.transformed(by: m)
+                            } else if transform.a < -0.5 && transform.d < -0.5 {
+                                ov = ov.transformed(by: CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: CGFloat(outW), ty: CGFloat(outH)))
+                            }
+                            img = ov.composited(over: img)
+                        }
+                    }
+                }
+                img = FilterChain.dither(img, vs, offset: params.noiseOffset)
 
                 guard let pool = adaptor.pixelBufferPool else { throw ExportError(message: "Kein Pixelpuffer-Pool.") }
                 var outBuf: CVPixelBuffer?
@@ -257,7 +292,7 @@ enum Exporter {
                 CVBufferSetAttachment(ob, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
                 CVBufferSetAttachment(ob, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
                 CVBufferSetAttachment(ob, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
-                guard adaptor.append(ob, withPresentationTime: pts) else {
+                guard adaptor.append(ob, withPresentationTime: outPTS) else {
                     throw writer.error ?? ExportError(message: "Frame konnte nicht geschrieben werden.")
                 }
                 frameIndex += 1

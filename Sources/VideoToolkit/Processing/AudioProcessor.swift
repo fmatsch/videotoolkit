@@ -75,6 +75,8 @@ enum AudioProcessor {
             }
         }
         progress?(0.1)
+        // 2a. Stimme vom Hintergrund trennen (Demucs)
+        if s.aiSeparate, let sep = VoiceSeparation.apply(ch, sampleRate: sr, backgroundLevel: s.backgroundLevel, progress: { progress?(0.1 + 0.2 * $0) }) { ch = sep }
         // 2b. KI-Stimmenverbesserung (DeepFilterNet3)
         var aiApplied = false
         if s.aiDenoise > 0, let dfn = DeepFilterNet.shared {

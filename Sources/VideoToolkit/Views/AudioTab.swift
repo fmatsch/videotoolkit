@@ -27,6 +27,7 @@ struct AudioTab: View {
                                     help: "Entfernt Dröhnen, Wind und Trittschall. 0 = aus.")
                     }
                     SectionCard(title: "Stimme", icon: "person.wave.2") {
+                        separation
                         ParamSlider(title: "Stimme klarer", value: a.clarity, range: 0...1,
                                     help: "Senkt Mulm bei ca. 300 Hz, hebt Präsenz und Luft an.")
                         ParamSlider(title: "Stimme in den Vordergrund", value: a.voiceFocus, range: 0...1,
@@ -54,6 +55,28 @@ struct AudioTab: View {
                     Button("Alle Audioeinstellungen zurücksetzen") { project.resetAudio() }
                 }
             }.padding(14)
+        }
+    }
+
+    @ViewBuilder private var separation: some View {
+        if DemucsSeparator.isAvailable {
+            Toggle("Stimme vom Hintergrund trennen (Demucs)", isOn: $project.audio.aiSeparate)
+            if project.audio.aiSeparate {
+                ParamSlider(title: "Restpegel des Hintergrunds", value: $project.audio.backgroundLevel, range: 0...1, neutral: 0.15,
+                            help: "0 = nur die Stimme, 1 = Original. Neuronales Netz (lokal); rechenintensiv, ca. 1× Echtzeit.")
+            }
+        } else {
+            Text("Stimme vom Hintergrund trennen (Demucs): Modell nicht gefunden.").font(.callout)
+            Text("Lade es einmalig mit „Scripts/fetch_models.sh demucs“ und baue die App neu, oder importiere den Ordner „htdemucs-ft-fused“.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button {
+                let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false
+                p.message = "Ordner „htdemucs-ft-fused“ wählen (enthält htdemucs_ft_fused.mlpackage)"
+                if p.runModal() == .OK, let u = p.url {
+                    do { try ModelLocator.importModel(from: u, as: "Optional/htdemucs-ft-fused"); project.objectWillChange.send() }
+                    catch { project.errorMessage = error.localizedDescription }
+                }
+            } label: { Label("Modell importieren …", systemImage: "square.and.arrow.down") }
         }
     }
 

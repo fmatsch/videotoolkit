@@ -3,3 +3,6 @@ build/
 .swiftpm/
 .DS_Store
 *.xcodeproj
+
+# Große optionale Modelle (Scripts/fetch_models.sh)
+Models/Optional/
