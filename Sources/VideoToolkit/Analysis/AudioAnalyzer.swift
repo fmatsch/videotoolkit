@@ -17,10 +17,29 @@ struct AudioAnalysis {
     var sibilanceDB: Float           // 5–9 kHz relativ zu 1–3 kHz
     var dynamicRangeDB: Float
     var speechFraction: Double
+    var clicksPerMinute: Double
+    var reverbRT60: Double?          // geschätzte Nachhallzeit (s) aus der Abklingsteilheit nach lauten Stellen
     var noiseProfile: NoiseProfile?
 }
 
 enum AudioAnalyzer {
+    /// Schätzt die Nachhallzeit: Median der Abklingsteilheit (dB/s) an Pegelabfällen von ≥ 12 dB, als RT60 = 60 dB / Steilheit.
+    static func decayRT60(_ L: [Float], floorDB: Float) -> Double? {
+        var est: [Double] = []
+        var i = 1
+        while i < L.count - 1 {
+            if L[i] > floorDB + 20 && L[i] >= L[i - 1] {
+                var j = i
+                while j + 1 < L.count && L[j + 1] <= L[j] + 1.0 && L[j + 1] > floorDB + 6 { j += 1 }
+                let drop = Double(L[i] - L[j]), dur = Double(j - i) * 0.02
+                if drop >= 12 && dur >= 0.04 { est.append(60 * dur / drop) }
+                i = max(j, i + 1)
+            } else { i += 1 }
+        }
+        guard est.count >= 4 else { return nil }
+        return est.sorted()[est.count / 2]
+    }
+
     static func analyze(_ pcm: PCMAudio) -> AudioAnalysis {
         let sr = pcm.sampleRate
         let mono = pcm.mono
@@ -85,6 +104,22 @@ enum AudioAnalyzer {
 
         let noise = AudioProcessor.estimateNoiseProfile(mono: mono, sampleRate: sr)
 
+        // Knackser (Trockenlauf)
+        var probe = Array(mono.prefix(Int(sr * 600)))
+        let clicks = AudioProcessor.declick(&probe, amount: 0.5, dryRun: true)
+        let clicksPerMin = Double(clicks) / max(Double(probe.count) / sr / 60, 0.05)
+
+        // Nachhall: Abklingzeit nach Sprachenden (20-ms-Pegel)
+        let blk20 = Int(sr * 0.02)
+        var lv: [Float] = []
+        var q = 0
+        while q + blk20 <= mono.count && lv.count < 30_000 {
+            var r: Float = 0
+            mono.withUnsafeBufferPointer { vDSP_rmsqv($0.baseAddress! + q, 1, &r, vDSP_Length(blk20)) }
+            lv.append(toDB(r)); q += blk20
+        }
+        let t60 = decayRT60(lv, floorDB: floorDB)
+
         return AudioAnalysis(
             duration: pcm.duration, peakDB: toDB(peak), clippedFraction: clippedFraction,
             loudnessLUFS: integratedLoudness(pcm.channels, sampleRate: sr),
@@ -92,6 +127,6 @@ enum AudioAnalyzer {
             humHz: humHz, humStrengthDB: humDB,
             rumbleDB: 10 * log10(band(20, 80) / band(200, 4000)),
             mudDB: rel(180, 450), dullnessDB: rel(4000, 8000), sibilanceDB: rel(5000, 9000),
-            dynamicRangeDB: dyn, speechFraction: active, noiseProfile: noise)
+            dynamicRangeDB: dyn, speechFraction: active, clicksPerMinute: clicksPerMin, reverbRT60: t60, noiseProfile: noise)
     }
 }

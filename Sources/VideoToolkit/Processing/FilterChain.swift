@@ -41,7 +41,10 @@ final class ColorLUT {
 struct FrameParams {
     var offset = CGPoint.zero      // Stabilisierungsversatz in Bildpixeln (CI-Koordinaten)
     var zoom: CGFloat = 1
+    var rotation: CGFloat = 0     // rad, um die Bildmitte
+    var shear: CGFloat = 0        // Rolling-Shutter: x += shear * (y - Mitte)
     var flickerGain: Float = 1
+    var noiseOffset = CGPoint.zero   // verschiebt das Dither-Rauschen pro Frame
 }
 
 enum FilterChain {
@@ -50,15 +53,58 @@ enum FilterChain {
         CIContext(options: [.workingColorSpace: colorSpace, .outputColorSpace: colorSpace])
     }
 
-    // Stufe 1: Stabilisierung + Flacker
-    static func stage1(_ input: CIImage, _ s: VideoSettings, _ p: FrameParams) -> CIImage {
+    // MARK: Objektiv & Bildfehler (vor der Stabilisierung, in der Reihenfolge der Bildentstehung rückwärts)
+
+    private static let lensKernel = CIWarpKernel(source: """
+        kernel vec2 lensWarp(vec2 center, float k, float rn) {
+            vec2 d = destCoord() - center;
+            float r2 = dot(d, d) * rn;
+            return center + d * (1.0 + k * r2);
+        }
+        """)
+    private static let vignetteKernel = CIColorKernel(source: """
+        kernel vec4 devignette(__sample s, vec2 center, float strength, float rn) {
+            vec2 d = destCoord() - center;
+            float r2 = dot(d, d) * rn;
+            float g = 1.0 + strength * (0.5 * r2 + 0.5 * r2 * r2);
+            return vec4(s.rgb * g, s.a);
+        }
+        """)
+
+    static func pre(_ input: CIImage, _ s: VideoSettings) -> CIImage {
         var img = input
         let rect = input.extent
-        if s.stabilize && (p.offset != .zero || p.zoom != 1) {
+        if s.deinterlace {
+            // vertikales 1-2-1-Filter glättet Kammartefakte
+            img = img.applyingFilter("CIConvolution3X3", parameters: [
+                "inputWeights": CIVector(values: [0, 0.25, 0, 0, 0.5, 0, 0, 0.25, 0], count: 9), "inputBias": 0,
+            ]).cropped(to: rect)
+        }
+        let center = CIVector(x: rect.midX, y: rect.midY)
+        let rn = 1 / Double(max(1, (rect.width * rect.width + rect.height * rect.height) / 4))
+        if abs(s.lensCorrection) > 0.005, let k = lensKernel {
+            // positiv = Tonnenverzeichnung (Weitwinkel) entfernen, negativ = Kissenverzeichnung
+            let kk = -0.35 * s.lensCorrection
+            if let out = k.apply(extent: rect, roiCallback: { _, r in r.insetBy(dx: -rect.width * 0.25, dy: -rect.height * 0.25) },
+                                 image: img.clampedToExtent(), arguments: [center, kk, rn]) { img = out }
+        }
+        if s.vignetteFix > 0.005, let k = vignetteKernel,
+           let out = k.apply(extent: rect, arguments: [img, center, s.vignetteFix * 2.4, rn]) { img = out }
+        return img.cropped(to: rect)
+    }
+
+    // Stufe 1: Objektiv/Bildfehler, Stabilisierung, Rolling Shutter, Flacker
+    static func stage1(_ input: CIImage, _ s: VideoSettings, _ p: FrameParams) -> CIImage {
+        var img = pre(input, s)
+        let rect = input.extent
+        if (s.stabilize || s.rollingShutter > 0.001) && (p.offset != .zero || p.zoom != 1 || p.rotation != 0 || p.shear != 0) {
             let cx = rect.midX, cy = rect.midY
-            var t = CGAffineTransform.identity
-            t = t.translatedBy(x: cx, y: cy).scaledBy(x: p.zoom, y: p.zoom).translatedBy(x: -cx + p.offset.x, y: -cy + p.offset.y)
-            img = input.clampedToExtent().transformed(by: t).cropped(to: rect)
+            var t = CGAffineTransform(translationX: -cx, y: -cy)
+            if abs(p.shear) > 1e-7 { t = t.concatenating(CGAffineTransform(a: 1, b: 0, c: p.shear, d: 1, tx: 0, ty: 0)) }
+            if abs(p.rotation) > 1e-7 { t = t.concatenating(CGAffineTransform(rotationAngle: p.rotation)) }
+            t = t.concatenating(CGAffineTransform(scaleX: p.zoom, y: p.zoom))
+            t = t.concatenating(CGAffineTransform(translationX: cx + p.offset.x, y: cy + p.offset.y))
+            img = img.clampedToExtent().transformed(by: t).cropped(to: rect)
         }
         if s.deflicker, abs(p.flickerGain - 1) > 0.002 {
             img = img.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: log2(Double(p.flickerGain))])
@@ -158,14 +204,30 @@ enum FilterChain {
         return img.cropped(to: target)
     }
 
-    static func finish(_ input: CIImage, _ s: VideoSettings, lut: ColorLUT?, scale: CGFloat) -> CIImage {
-        scaleSharpen(applyLUT(input, s, lut: lut), s, scale: scale)
+    static func finish(_ input: CIImage, _ s: VideoSettings, lut: ColorLUT?, scale: CGFloat, noiseOffset: CGPoint = .zero) -> CIImage {
+        dither(scaleSharpen(applyLUT(input, s, lut: lut), s, scale: scale), s, offset: noiseOffset)
     }
 
-    static func zoomFor(offsets: [CGPoint], analysisWidth: Double, analysisHeight: Double) -> CGFloat {
-        var mx = 0.0, my = 0.0
-        for o in offsets { mx = max(mx, abs(Double(o.x))); my = max(my, abs(Double(o.y))) }
-        let z = max(1 + 2 * mx / analysisWidth, 1 + 2 * my / analysisHeight) * 1.02
-        return CGFloat(min(1.25, z))
+    /// Feines Rauschen (Dither) verdeckt Streifen in Verläufen nach der Neukodierung.
+    static func dither(_ input: CIImage, _ s: VideoSettings, offset: CGPoint) -> CIImage {
+        guard s.deband > 0.005, let noise = CIFilter(name: "CIRandomGenerator")?.outputImage else { return input }
+        let amp = 0.012 * s.deband
+        let mono = noise.transformed(by: CGAffineTransform(translationX: offset.x, y: offset.y))
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 1.0 / 3, y: 1.0 / 3, z: 1.0 / 3, w: 0),
+                "inputGVector": CIVector(x: 1.0 / 3, y: 1.0 / 3, z: 1.0 / 3, w: 0),
+                "inputBVector": CIVector(x: 1.0 / 3, y: 1.0 / 3, z: 1.0 / 3, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            ])
+            // Grauwert 0,5 ± amp (Mittelwert der Summe dreier Gleichverteilungen ≈ 0,5 mit kleiner Streuung → verstärken)
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 6 * amp, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: 6 * amp, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: 6 * amp, w: 0),
+                "inputBiasVector": CIVector(x: 0.5 - 3 * amp, y: 0.5 - 3 * amp, z: 0.5 - 3 * amp, w: 0),
+            ])
+            .cropped(to: input.extent)
+        return mono.applyingFilter("CIOverlayBlendMode", parameters: [kCIInputBackgroundImageKey: input]).cropped(to: input.extent)
     }
 }

@@ -20,6 +20,9 @@ struct AudioTab: View {
                         Picker("Netzbrummen", selection: a.humHz) {
                             Text("Aus").tag(0.0); Text("50 Hz").tag(50.0); Text("60 Hz").tag(60.0)
                         }.pickerStyle(.segmented)
+                        ParamSlider(title: "Knackser und Klicks entfernen", value: a.declick, range: 0...1)
+                        ParamSlider(title: "Raumhall verringern", value: a.dereverb, range: 0...1,
+                                    help: "Unterdrückt späte Reflexionen – Sprache klingt trockener und näher.")
                         ParamSlider(title: "Tiefenfilter (Hz)", value: a.highPassHz, range: 0...200, format: "%.0f",
                                     help: "Entfernt Dröhnen, Wind und Trittschall. 0 = aus.")
                     }
@@ -29,6 +32,8 @@ struct AudioTab: View {
                         ParamSlider(title: "Stimme in den Vordergrund", value: a.voiceFocus, range: 0...1,
                                     help: "Erkennt Sprache und dämpft Pausen und Umgebung.")
                         ParamSlider(title: "S-Laute entschärfen", value: a.deEss, range: 0...1)
+                        ParamSlider(title: "Atemgeräusche absenken", value: a.breath, range: 0...1,
+                                    help: "Erkennt Einatmen zwischen Sätzen (gleichmäßiges Rauschen ohne Stimmton) und senkt es ab.")
                     }
                     SectionCard(title: "Lautstärke", icon: "speaker.wave.3") {
                         ParamSlider(title: "Kompression", value: a.compression, range: 0...1,

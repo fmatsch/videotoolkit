@@ -16,6 +16,13 @@ struct VideoSettings: Equatable {
     var deflicker: Bool = false
     var stabilize: Bool = false
     var stabilizeStrength: Double = 0.6 // 0 ... 1 (Glättungsradius)
+    var stabilizeRotation: Bool = true  // auch Kippen/Drehen ausgleichen
+    var rollingShutter: Double = 0      // 0 ... 1 (Schräglage bei Schwenks)
+    var lensCorrection: Double = 0      // -1 ... 1 (Tonnen-/Kissenverzeichnung)
+    var vignetteFix: Double = 0         // 0 ... 1 (Randabdunklung aufhellen)
+    var deband: Double = 0              // 0 ... 1 (Streifen in Verläufen verdecken)
+    var deinterlace: Bool = false       // Kammartefakte entfernen
+    var reframe: Reframe = .none        // Hochformat/Quadrat mit Personenverfolgung
     var upscale: Double = 1             // 1, 1.5, 2, 3
     var aiUpscale: Bool = false         // Real-ESRGAN statt Lanczos
     var referenceStrength: Double = 0   // 0 ... 1
@@ -32,6 +39,11 @@ struct AudioSettings: Equatable {
     var aiDenoise: Double = 0           // 0 ... 1  (DeepFilterNet3, Core ML)
     var noiseReduction: Double = 0      // 0 ... 1
     var humHz: Double = 0               // 0 (aus), 50, 60
+    var declick: Double = 0             // 0 ... 1 (Knackser/Klicks entfernen)
+    var breath: Double = 0              // 0 ... 1 (Atemgeräusche absenken)
+    var dereverb: Double = 0            // 0 ... 1 (Raumhall verringern)
+    var aiSeparate: Bool = false        // Stimme vom Hintergrund trennen (Demucs)
+    var backgroundLevel: Double = 0.15  // Restpegel des Hintergrunds, 0 = nur Stimme
     var highPassHz: Double = 0          // 0 (aus) ... 200
     var clarity: Double = 0             // 0 ... 1  (Stimme klarer: Mulm raus, Präsenz rein)
     var voiceFocus: Double = 0          // 0 ... 1  (Stimme in den Vordergrund)
@@ -48,8 +60,18 @@ struct AudioSettings: Equatable {
     var eqAir: Double = 0               // High-Shelf 10 kHz
 
     var isNeutral: Bool {
-        var s = self; s.limiter = true; s.targetLUFS = -16
+        var s = self; s.limiter = true; s.targetLUFS = -16; s.backgroundLevel = 0.15
         return s == AudioSettings()
+    }
+}
+
+/// Zielformat für den automatischen Bildausschnitt.
+enum Reframe: String, CaseIterable, Identifiable {
+    case none = "Original", vertical = "Hochformat 9:16", portrait = "Hochformat 4:5", square = "Quadrat 1:1"
+    var id: String { rawValue }
+    /// Breite / Höhe, nil = unverändert
+    var aspect: Double? {
+        switch self { case .none: nil; case .vertical: 9.0 / 16; case .portrait: 4.0 / 5; case .square: 1 }
     }
 }
 
@@ -69,6 +91,8 @@ enum FixID: String, CaseIterable, Identifiable {
     case exposure, shadows, highlights, contrast, whiteBalance, saturation
     case denoise, sharpen, stabilize, deflicker, upscale
     case audioHum, audioRumble, audioNoise, audioClarity, audioVoice, audioDynamics, audioLoudness, audioDeEss
+    case rollingShutter, lens, vignette, deband, deinterlace
+    case audioClicks, audioBreath, audioReverb, audioSeparate
     var id: String { rawValue }
     var isAudio: Bool { rawValue.hasPrefix("audio") }
 }

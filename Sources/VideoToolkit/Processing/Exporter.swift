@@ -38,17 +38,17 @@ enum Exporter {
 
         // 1. Bewegungsdaten für Stabilisierung/Flackern über das gesamte Video
         var motionData = motion
-        if vs.stabilize || vs.deflicker, motionData?.coversWholeAsset != true {
+        if vs.stabilize || vs.deflicker || vs.rollingShutter > 0.001, motionData?.coversWholeAsset != true {
             progress(0, "Bewegung analysieren …")
             motionData = try await MotionPass.run(asset: asset, maxSeconds: nil) { progress(0.2 * $0, "Bewegung analysieren …") }
         }
         motionData?.cuts.formUnion(sceneCuts)
-        var offsets: [CGPoint] = [], zoom: CGFloat = 1, gains: [Float] = []
+        var stab: [MotionPass.StabFrame] = [], zoom: CGFloat = 1, gains: [Float] = []
         if let m = motionData {
-            if vs.stabilize {
-                offsets = MotionPass.stabilizationOffsets(m, strength: vs.stabilizeStrength)
-                zoom = FilterChain.zoomFor(offsets: offsets, analysisWidth: m.analysisWidth,
-                                           analysisHeight: m.analysisWidth * Double(natural.height / natural.width))
+            if vs.stabilize || vs.rollingShutter > 0.001 {
+                (stab, zoom) = MotionPass.stabilization(m, strength: vs.stabilizeStrength, translate: vs.stabilize, rotation: vs.stabilizeRotation,
+                                                        rollingShutter: vs.rollingShutter,
+                                                        analysisHeight: m.analysisWidth * Double(natural.height / natural.width))
             }
             if vs.deflicker { gains = MotionPass.deflickerGains(m) }
         }
@@ -168,7 +168,7 @@ enum Exporter {
         let upscaler: AIUpscaler? = (vs.aiUpscale && vs.upscale > 1.01 && AIModels.upscalerAvailable) ? try await AIUpscaler.load() : nil
         var frameIndex = 0
         var sceneIdx = 0
-        let baseProgress = (vs.stabilize || vs.deflicker) ? 0.3 : 0.1
+        let baseProgress = (vs.stabilize || vs.deflicker || vs.rollingShutter > 0.001) ? 0.3 : 0.1
 
         do {
             while let sb = vOut.copyNextSampleBuffer() {
@@ -178,9 +178,10 @@ enum Exporter {
                 while !vIn.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
 
                 var params = FrameParams()
-                if frameIndex < offsets.count {
-                    let o = offsets[frameIndex]
-                    params.offset = CGPoint(x: o.x * offsetScale, y: o.y * offsetScale)
+                if frameIndex < stab.count {
+                    let o = stab[frameIndex]
+                    params.offset = CGPoint(x: o.dx * offsetScale, y: o.dy * offsetScale)
+                    params.rotation = CGFloat(o.rot); params.shear = CGFloat(o.shear)
                     params.zoom = zoom
                 }
                 if frameIndex < gains.count { params.flickerGain = gains[frameIndex] }
@@ -214,6 +215,7 @@ enum Exporter {
                         prevTemporal = nil
                     }
                 }
+                params.noiseOffset = CGPoint(x: Double((frameIndex * 97) % 509), y: Double((frameIndex * 53) % 503))
                 img = FilterChain.color(img, fs)
                 if let ai = upscaler {
                     // KI-Hochskalierung: Farbe + Referenz anwenden, in Puffer rendern, 4× hochrechnen, auf Zielgröße skalieren
@@ -226,9 +228,9 @@ enum Exporter {
                     ctx.render(base, to: src, bounds: rect, colorSpace: FilterChain.colorSpace)
                     let big = try ai.upscale4x(src)
                     let bigImg = CIImage(cvPixelBuffer: big, options: [.colorSpace: FilterChain.colorSpace])
-                    img = FilterChain.scaleSharpen(bigImg, vs, scale: CGFloat(vs.upscale) / 4)
+                    img = FilterChain.dither(FilterChain.scaleSharpen(bigImg, vs, scale: CGFloat(vs.upscale) / 4), vs, offset: params.noiseOffset)
                 } else {
-                    img = FilterChain.finish(img, fs, lut: frameLUT, scale: CGFloat(vs.upscale))
+                    img = FilterChain.finish(img, fs, lut: frameLUT, scale: CGFloat(vs.upscale), noiseOffset: params.noiseOffset)
                 }
 
                 guard let pool = adaptor.pixelBufferPool else { throw ExportError(message: "Kein Pixelpuffer-Pool.") }

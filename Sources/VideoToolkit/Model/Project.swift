@@ -68,7 +68,7 @@ final class Project: ObservableObject {
     private var renderer: PreviewRenderer?
     private var currentFrame: (time: Double, image: CGImage)?
     private var previewTask: Task<Void, Never>?
-    private var stabCache: (strength: Double, offsets: [CGPoint], zoom: CGFloat)?
+    private var stabCache: (key: [Double], frames: [MotionPass.StabFrame], zoom: CGFloat)?
     private var gainsCache: [Float]?
 
     // Audio-Vorschau
@@ -338,16 +338,18 @@ final class Project: ObservableObject {
         guard let va = videoAnalysis, let m = va.motion, m.count > 0 else { return p }
         let idx = max(0, Int(t * m.fps))
         guard idx < m.count else { return p }   // Analyse deckt nur den Anfang ab; Export rechnet vollständig
-        if settings.stabilize {
-            if stabCache?.strength != settings.stabilizeStrength {
-                let o = MotionPass.stabilizationOffsets(m, strength: settings.stabilizeStrength)
-                stabCache = (settings.stabilizeStrength, o,
-                             FilterChain.zoomFor(offsets: o, analysisWidth: m.analysisWidth,
-                                                 analysisHeight: m.analysisWidth * Double(va.height) / Double(va.width)))
+        if settings.stabilize || settings.rollingShutter > 0.001 {
+            let key = [settings.stabilizeStrength, settings.stabilize ? 1 : 0, settings.stabilizeRotation ? 1 : 0, settings.rollingShutter]
+            if stabCache?.key != key {
+                let r = MotionPass.stabilization(m, strength: settings.stabilizeStrength, translate: settings.stabilize,
+                                                 rotation: settings.stabilizeRotation, rollingShutter: settings.rollingShutter,
+                                                 analysisHeight: m.analysisWidth * Double(va.height) / Double(va.width))
+                stabCache = (key, r.frames, r.zoom)
             }
-            if let c = stabCache, idx < c.offsets.count {
+            if let c = stabCache, idx < c.frames.count {
                 let k = Double(va.width) / m.analysisWidth
-                p.offset = CGPoint(x: c.offsets[idx].x * k, y: c.offsets[idx].y * k)
+                p.offset = CGPoint(x: c.frames[idx].dx * k, y: c.frames[idx].dy * k)
+                p.rotation = CGFloat(c.frames[idx].rot); p.shear = CGFloat(c.frames[idx].shear)
                 p.zoom = c.zoom
             }
         }

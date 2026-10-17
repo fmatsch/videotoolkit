@@ -33,8 +33,19 @@ struct VideoTab: View {
                         if project.video.stabilize {
                             ParamSlider(title: "Glättung", value: v.stabilizeStrength, range: 0...1, neutral: 0.6,
                                         help: "Stärker = ruhigere Kamera, aber mehr Bildausschnitt geht verloren.")
+                            Toggle("Kippen und Drehen ausgleichen", isOn: v.stabilizeRotation)
                         }
+                        ParamSlider(title: "Rolling Shutter (Schräglage bei Schwenks)", value: v.rollingShutter, range: 0...1,
+                                    help: "Richtet senkrechte Linien auf, die bei schnellen Schwenks kippen. 1,0 entspricht einer Auslesezeit von einer ganzen Framedauer, bei Handys sind 0,4–0,8 typisch.")
                         Toggle("Helligkeitsflackern entfernen", isOn: v.deflicker)
+                    }
+                    SectionCard(title: "Objektiv & Bildfehler", icon: "camera.aperture") {
+                        ParamSlider(title: "Verzeichnung (Weitwinkel)", value: v.lensCorrection, range: -1...1,
+                                    help: "Positiv: Tonnenverzeichnung von Weitwinkel- und Actioncams entfernen, negativ: Kissenverzeichnung.")
+                        ParamSlider(title: "Randabdunklung aufhellen", value: v.vignetteFix, range: 0...1)
+                        ParamSlider(title: "Streifen in Verläufen verdecken", value: v.deband, range: 0...1,
+                                    help: "Feines Rauschen gegen Banding. Nur im Export sichtbar.")
+                        Toggle("Zeilensprung (Interlacing) entfernen", isOn: v.deinterlace)
                     }
                     SectionCard(title: "Auflösung", icon: "arrow.up.left.and.arrow.down.right") {
                         Picker("Hochskalieren", selection: v.upscale) {

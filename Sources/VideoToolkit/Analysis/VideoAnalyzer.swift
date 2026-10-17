@@ -11,6 +11,8 @@ struct MotionData {
     var lumas: [Float] = []
     /// Verschiebung von Frame k-1 nach Frame k in Analyse-Pixeln (Frame 0 = 0).
     var translations: [CGPoint] = []
+    /// Drehung von Frame k-1 nach Frame k in Radiant (Frame 0 = 0), im selben Vorzeichensinn wie `translations`.
+    var rotations: [Double] = []
     /// Index-Ende der Szenen (Schnitte), für Glättung innerhalb von Szenen.
     var cuts: Set<Int> = []
     var coversWholeAsset = false
@@ -32,6 +34,12 @@ struct VideoAnalysis {
     var faceCount: Int
     var faceLuma: Double?
     var shakePercent: Double        // RMS hochfrequentes Wackeln in % der Bildbreite
+    var vignetteRatio: Double       // Ecken/Mitte (Median über Beispielbilder)
+    var vignetteP75: Double
+    var combFraction: Double
+    var bandingFraction: Double
+    var rotShakeDegrees: Double     // RMS hochfrequentes Kippen in Grad
+    var panSpeedPercent: Double     // 90. Perzentil der Horizontalgeschwindigkeit in % Bildbreite pro Frame
     var flickerPercent: Double
     var motion: MotionData?
     /// Verkleinerte Beispielbilder (für Referenzabgleich).
@@ -86,7 +94,8 @@ enum VideoAnalyzer {
             meanSaturation: agg.saturation, neutralRGB: agg.neutral,
             sharpness: agg.sharpness, noiseSigma: agg.noise,
             faceCount: faceCount, faceLuma: faceLumas.isEmpty ? nil : faceLumas.reduce(0, +) / Double(faceLumas.count),
-            shakePercent: shake, flickerPercent: flicker, motion: motion, samples: samples)
+            shakePercent: shake, vignetteRatio: agg.vignette, vignetteP75: agg.vignetteP75, combFraction: agg.comb, bandingFraction: agg.banding, rotShakeDegrees: MotionPass.rotShakeDegrees(motion), panSpeedPercent: MotionPass.panSpeedPercent(motion),
+            flickerPercent: flicker, motion: motion, samples: samples)
     }
 
     // MARK: Einzelbild
@@ -96,6 +105,7 @@ enum VideoAnalyzer {
         var meanLuma = 0.0, shadowClip = 0.0, highlightClip = 0.0, saturation = 0.0
         var neutral = SIMD3<Double>(0, 0, 0), neutralCount = 0.0
         var sharpness = 0.0, noise = 0.0
+        var vignette = 1.0, comb = 0.0, banding = 0.0
     }
 
     struct StatsAggregate {
@@ -109,6 +119,10 @@ enum VideoAnalyzer {
         var highlightClip: Double { avg(\.highlightClip) }
         var saturation: Double { avg(\.saturation) }
         var sharpness: Double { frames.isEmpty ? 0 : median(frames.map(\.sharpness)) }
+        var vignette: Double { frames.isEmpty ? 1 : median(frames.map(\.vignette)) }
+        var vignetteP75: Double { frames.isEmpty ? 1 : { let s = frames.map(\.vignette).sorted(); return s[min(s.count - 1, s.count * 3 / 4)] }() }
+        var comb: Double { frames.isEmpty ? 0 : median(frames.map(\.comb)) }
+        var banding: Double { frames.isEmpty ? 0 : median(frames.map(\.banding)) }
         var noise: Double { frames.isEmpty ? 0 : median(frames.map(\.noise)) }
         var neutral: SIMD3<Double> {
             var s = SIMD3<Double>(0, 0, 0), n = 0.0
@@ -204,6 +218,56 @@ enum VideoAnalyzer {
         return max(0, min(1, 1 - r / o))
     }
 
+    /// Anteil texturierter 16×16-Blöcke, in denen benachbarte Zeilen stärker abweichen als Zeilen im Abstand 2 (Kammartefakte).
+    static func combFraction(_ y: [Float], w: Int, h: Int) -> Double {
+        var comb = 0, total = 0
+        var by = 0
+        while by + 18 <= h {
+            var bx = 0
+            while bx + 16 <= w {
+                var d1: Float = 0, d2: Float = 0
+                for r in by..<(by + 16) {
+                    for x in bx..<(bx + 16) {
+                        let a = y[r * w + x]
+                        d1 += abs(a - y[(r + 1) * w + x]); d2 += abs(a - y[(r + 2) * w + x])
+                    }
+                }
+                if d1 + d2 > 256 * 0.02 { total += 1; if d1 > d2 * 1.4 && d1 > 256 * 0.02 { comb += 1 } }
+                bx += 16
+            }
+            by += 16
+        }
+        return total > 0 ? Double(comb) / Double(total) : 0
+    }
+
+    /// Anteil der Blöcke, die wie ein flacher Verlauf mit wenigen sichtbaren Helligkeitsstufen aussehen.
+    static func bandingFraction(_ y: [Float], w: Int, h: Int) -> Double {
+        var banded = 0, total = 0
+        var by = 0
+        while by + 16 <= h {
+            var bx = 0
+            while bx + 16 <= w {
+                var seen = [Bool](repeating: false, count: 256)
+                var lo = 255, hi = 0, distinct = 0, changes = 0
+                for r in by..<(by + 16) {
+                    for x in bx..<(bx + 16) {
+                        let v = Int(y[r * w + x] * 255 + 0.5)
+                        if !seen[v] { seen[v] = true; distinct += 1 }
+                        lo = min(lo, v); hi = max(hi, v)
+                        if x > bx, v != Int(y[r * w + x - 1] * 255 + 0.5) { changes += 1 }
+                        if r > by, v != Int(y[(r - 1) * w + x] * 255 + 0.5) { changes += 1 }
+                    }
+                }
+                total += 1
+                // wenige Stufen (1–3 Helligkeitswerte Abstand), und sie bilden zusammenhängende Flächen statt Rauschen
+                if distinct >= 2 && distinct <= 4 && hi - lo <= 3 && changes <= 40 { banded += 1 }
+                bx += 16
+            }
+            by += 16
+        }
+        return total > 0 ? Double(banded) / Double(total) : 0
+    }
+
     static func frameStats(_ full: CGImage) -> (FrameStats, [Double]) {
         var st = FrameStats()
         // Farb-/Helligkeitsstatistik auf 640 px Breite
@@ -229,6 +293,18 @@ enum VideoAnalyzer {
         st.shadowClip /= Double(n); st.highlightClip /= Double(n)
         st.hist = st.hist.map { $0 / Double(n) }
 
+        // Vignettierung: Ecken gegenüber Bildmitte
+        func patchMean(_ x0: Int, _ y0: Int, _ pw: Int, _ ph: Int) -> Double {
+            var s = 0.0
+            for yy in y0..<(y0 + ph) { for xx in x0..<(x0 + pw) { s += Double(y[yy * w + xx]) } }
+            return s / Double(max(1, pw * ph))
+        }
+        let pw = w / 8, ph = h / 8
+        let brightestCorner = max(patchMean(0, 0, pw, ph), patchMean(w - pw, 0, pw, ph), patchMean(0, h - ph, pw, ph), patchMean(w - pw, h - ph, pw, ph))
+        let center = patchMean(w / 2 - pw, h / 2 - ph, 2 * pw, 2 * ph)
+        // Nur wenn ALLE vier Ecken dunkler als die Mitte sind, spricht das für Vignettierung (Himmel/Wiese-Szenen fallen durch)
+        st.vignette = center > 0.05 ? min(2, brightestCorner / center) : 1
+
         // Rauschen: Immerkaer-Operator auf nativem Mittel-Ausschnitt, flache Blöcke
         let cw = min(full.width, 960), ch = min(full.height, 540)
         if let crop = full.cropping(to: CGRect(x: (full.width - cw) / 2, y: (full.height - ch) / 2, width: cw, height: ch)),
@@ -242,6 +318,8 @@ enum VideoAnalyzer {
             let m = Double(percentile(nb, 0.2))
             st.noise = (Double.pi / 2).squareRoot() * m / 6
             st.sharpness = reblurSharpness(cy, w: cw, h: ch)
+            st.comb = combFraction(cy, w: cw, h: ch)
+            st.banding = bandingFraction(cy, w: cw, h: ch)
         }
 
         // Gesichter
@@ -299,22 +377,25 @@ enum MotionPass {
             guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
             let l = meanLuma(pb)
             var t = CGPoint.zero
+            var rot = 0.0
             if let prev = prevBuffer {
                 let cut = abs(l - prevLuma) > 0.14
-                let req = VNTranslationalImageRegistrationRequest(targetedCVPixelBuffer: pb)
+                let req = VNHomographicImageRegistrationRequest(targetedCVPixelBuffer: pb)
                 let handler = VNImageRequestHandler(cvPixelBuffer: prev, options: [:])
                 if !cut, (try? handler.perform([req])) != nil,
-                   let obs = req.results?.first as? VNImageTranslationAlignmentObservation {
-                    // alignmentTransform bringt Frame k auf Frame k-1 → Kamerabewegung ist die Inverse
-                    let a = obs.alignmentTransform
-                    t = CGPoint(x: -a.tx, y: -a.ty)
-                    if hypot(t.x, t.y) > Double(aw) * 0.12 { t = .zero; data.cuts.insert(index) }
+                   let obs = req.results?.first as? VNImageHomographicAlignmentObservation {
+                    // warpTransform bringt Frame k auf Frame k-1 (Pixelkoordinaten) → Kamerabewegung ist die Inverse
+                    let sim = MotionPass.similarity(from: obs.warpTransform, width: Double(aw), height: Double(CVPixelBufferGetHeight(pb)))
+                    t = CGPoint(x: -sim.tx, y: -sim.ty)
+                    rot = -sim.theta
+                    if hypot(t.x, t.y) > Double(aw) * 0.12 || abs(rot) > 0.15 { t = .zero; rot = 0; data.cuts.insert(index) }
                 } else if cut {
                     data.cuts.insert(index)
                 }
             }
             data.lumas.append(l)
             data.translations.append(t)
+            data.rotations.append(rot)
             prevBuffer = copy(pb)
             prevLuma = l
             index += 1
@@ -324,6 +405,32 @@ enum MotionPass {
         data.coversWholeAsset = limit >= total - 0.5
         progress(1)
         return data
+    }
+
+    /// Passt eine Ähnlichkeitstransformation (Verschiebung der Bildmitte, Drehung) per Kleinste-Quadrate-Verfahren an die
+    /// projektive Abbildung über ein Punktraster an. Robuster als die Zerlegung der 8-Parameter-Matrix.
+    static func similarity(from m: matrix_float3x3, width w: Double, height h: Double) -> (tx: Double, ty: Double, theta: Double) {
+        func map(_ x: Double, _ y: Double) -> (Double, Double) {
+            let X = Double(m.columns.0.x) * x + Double(m.columns.1.x) * y + Double(m.columns.2.x)
+            let Y = Double(m.columns.0.y) * x + Double(m.columns.1.y) * y + Double(m.columns.2.y)
+            let W = Double(m.columns.0.z) * x + Double(m.columns.1.z) * y + Double(m.columns.2.z)
+            let d = abs(W) > 0.05 ? W : 1
+            return (X / d, Y / d)
+        }
+        var pts: [(Double, Double)] = [], qs: [(Double, Double)] = []
+        for iy in 0..<5 { for ix in 0..<7 {
+            let x = w * (0.1 + 0.8 * Double(ix) / 6), y = h * (0.1 + 0.8 * Double(iy) / 4)
+            pts.append((x, y)); qs.append(map(x, y))
+        } }
+        let n = Double(pts.count)
+        let pcx = pts.reduce(0) { $0 + $1.0 } / n, pcy = pts.reduce(0) { $0 + $1.1 } / n
+        let qcx = qs.reduce(0) { $0 + $1.0 } / n, qcy = qs.reduce(0) { $0 + $1.1 } / n
+        var dot = 0.0, cross = 0.0, norm = 0.0
+        for i in 0..<pts.count {
+            let px = pts[i].0 - pcx, py = pts[i].1 - pcy, qx = qs[i].0 - qcx, qy = qs[i].1 - qcy
+            dot += px * qx + py * qy; cross += px * qy - py * qx; norm += px * px + py * py
+        }
+        return (qcx - pcx, qcy - pcy, atan2(cross / norm, dot / norm))
     }
 
     /// Reader-Puffer werden recycelt; für den Vorgänger-Frame eine Kopie halten.
@@ -384,21 +491,64 @@ enum MotionPass {
         return out
     }
 
-    /// Korrekturversatz pro Frame (Analyse-Pixel), der den Pfad auf die geglättete Bahn legt.
-    static func stabilizationOffsets(_ m: MotionData, strength: Double) -> [CGPoint] {
+    /// Korrektur pro Frame: Verschiebung (Analyse-Pixel), Drehung (rad), Scherung durch Rolling Shutter (dimensionslos).
+    struct StabFrame { var dx = 0.0, dy = 0.0, rot = 0.0, shear = 0.0 }
+
+    static func stabilization(_ m: MotionData, strength: Double, translate: Bool = true, rotation: Bool, rollingShutter: Double,
+                              analysisHeight: Double) -> (frames: [StabFrame], zoom: CGFloat) {
         let n = m.count
-        guard n > 2 else { return [CGPoint](repeating: .zero, count: n) }
-        var px = [Double](repeating: 0, count: n), py = px
-        var ax = 0.0, ay = 0.0
+        guard n > 2 else { return ([StabFrame](repeating: StabFrame(), count: n), 1) }
+        var px = [Double](repeating: 0, count: n), py = px, pr = px
+        var ax = 0.0, ay = 0.0, ar = 0.0
         for i in 0..<n {
-            // Bei Schnitten Pfad neu beginnen (Offset 0)
-            if m.cuts.contains(i) { ax = 0; ay = 0 } else { ax += Double(m.translations[i].x); ay += Double(m.translations[i].y) }
-            px[i] = ax; py[i] = ay
+            if m.cuts.contains(i) { ax = 0; ay = 0; ar = 0 } else {
+                ax += Double(m.translations[i].x); ay += Double(m.translations[i].y)
+                ar += i < m.rotations.count ? m.rotations[i] : 0
+            }
+            px[i] = ax; py[i] = ay; pr[i] = ar
         }
         let radius = max(2, Int(m.fps * (0.25 + 1.75 * strength)))
         let sx = smooth(px, radius: radius, cuts: m.cuts), sy = smooth(py, radius: radius, cuts: m.cuts)
-        // Kameraposition p (Bildinhalt wandert -p). Korrektur: Inhalt um (smooth - p) verschieben.
-        return (0..<n).map { CGPoint(x: sx[$0] - px[$0], y: sy[$0] - py[$0]) }
+        let sr = smooth(pr, radius: radius, cuts: m.cuts)
+        var frames = [StabFrame](repeating: StabFrame(), count: n)
+        for i in 0..<n {
+            if translate { frames[i].dx = sx[i] - px[i]; frames[i].dy = sy[i] - py[i] }
+            if translate && rotation { frames[i].rot = sr[i] - pr[i] }
+            if rollingShutter > 0.001 {
+                // Horizontalgeschwindigkeit dieses Frames (Mittel aus Paar davor und danach), leicht geglättet
+                let u0 = Double(m.translations[i].x), u1 = i + 1 < n ? Double(m.translations[i + 1].x) : u0
+                let u = (u0 + u1) / 2
+                frames[i].shear = u * rollingShutter / analysisHeight   // 1,0 = Auslesezeit entspricht einer ganzen Framedauer
+            }
+        }
+        // Zoom: Platz für Verschiebung und Drehung
+        let w = m.analysisWidth, h = analysisHeight
+        let aspect = max(w / h, h / w)
+        var z = 1.0
+        for f in frames {
+            let rz = cos(abs(f.rot)) + sin(abs(f.rot)) * aspect
+            let tz = 1 + 2 * max(abs(f.dx) / w, abs(f.dy) / h)
+            z = max(z, rz * tz + abs(f.shear) * 0.5)
+        }
+        return (frames, CGFloat(min(1.3, z * 1.02)))
+    }
+
+    static func rotShakeDegrees(_ m: MotionData) -> Double {
+        let n = m.count
+        guard n > Int(m.fps) * 2, m.rotations.count == n else { return 0 }
+        var pr = [Double](repeating: 0, count: n)
+        var a = 0.0
+        for i in 0..<n { if m.cuts.contains(i) { a = 0 } else { a += m.rotations[i] }; pr[i] = a }
+        let s = smooth(pr, radius: max(3, Int(m.fps * 0.5)), cuts: m.cuts)
+        var acc = 0.0
+        for i in 0..<n { acc += pow(pr[i] - s[i], 2) }
+        return (acc / Double(n)).squareRoot() * 180 / .pi
+    }
+
+    static func panSpeedPercent(_ m: MotionData) -> Double {
+        guard m.count > 10 else { return 0 }
+        let v = m.translations.enumerated().filter { !m.cuts.contains($0.offset) }.map { Float(abs($0.element.x)) }
+        return Double(percentile(v, 0.9)) / m.analysisWidth * 100
     }
 
     static func shakePercent(_ m: MotionData) -> Double {

@@ -54,6 +54,8 @@ enum AudioProcessor {
         let sr = input.sampleRate
         guard !s.isNeutral, input.frames > 0 else { return input }
 
+        // 0. Knackser und Klicks
+        if s.declick > 0 { for c in 0..<ch.count { _ = declick(&ch[c], amount: s.declick) } }
         // 1. Netzbrummen: Kerbfilter auf Grundton + Obertönen
         if s.humHz > 0 {
             for c in 0..<ch.count {
@@ -85,10 +87,10 @@ enum AudioProcessor {
             }
         }
         // 3. Spektrale Rauschminderung + Stimmen-Fokus
-        if s.noiseReduction > 0 || s.voiceFocus > 0 {
+        if s.noiseReduction > 0 || s.voiceFocus > 0 || s.breath > 0 || s.dereverb > 0 {
             let profile = (aiApplied ? nil : noise) ?? estimateNoiseProfile(mono: PCMAudio(channels: ch, sampleRate: sr).mono, sampleRate: sr)
             ch = spectralStage(ch, sampleRate: sr, amount: s.noiseReduction, focus: s.voiceFocus,
-                               noise: profile) { progress?(0.1 + 0.6 * $0) }
+                               breath: s.breath, reverb: s.dereverb, noise: profile) { progress?(0.1 + 0.6 * $0) }
         }
         progress?(0.7)
         // 4. EQ
@@ -128,6 +130,7 @@ enum AudioProcessor {
     // MARK: Spektralstufe
 
     private static func spectralStage(_ channels: [[Float]], sampleRate sr: Double, amount: Double, focus: Double,
+                                      breath: Double = 0, reverb: Double = 0,
                                       noise: NoiseProfile?, progress: (Double) -> Void) -> [[Float]] {
         let nCh = channels.count
         let n = channels[0].count
@@ -159,6 +162,20 @@ enum AudioProcessor {
         var im = re
         var seg = [Float](repeating: 0, count: N)
         var vad: Float = 0
+        // Atemgeräusche: gleitende Referenz für den Sprachpegel, geglättete Wahrscheinlichkeit
+        var speechRef: Float = 1e-9
+        var breathProb: Float = 0
+        var pEma = [Float](repeating: 0, count: bins)
+        // Hall: zeitlich geglättete Leistung und Verzögerungsspeicher
+        let delay = 10
+        var pSmooth = [Float](repeating: 0, count: bins)
+        var history = [[Float]](repeating: [Float](repeating: 0, count: bins), count: delay)
+        var histPos = 0
+        let revDecay = Float(exp(-6.9 * Double(delay * H) / sr / 0.6))   // Leistung nach 53 ms bei T60 = 0,6 s
+        let revBeta = Float(0.5 + 1.5 * reverb)
+        let revFloor = fromDB(-Float(6 + 14 * reverb))
+        let hf0 = Int(4000 / binHz), hf1 = min(bins - 1, Int(12000 / binHz))
+        let pk0 = max(1, Int(100 / binHz)), pk1 = min(bins - 1, Int(1000 / binHz))
 
         for t in 0..<totalFrames {
             let s0 = t * H
@@ -178,6 +195,20 @@ enum AudioProcessor {
             let target = min(1, max(0, (snrDB - 4) / 10))
             vad = target > vad ? vad + 0.7 * (target - vad) : vad * 0.985 + target * 0.015
 
+            // Atemgeräusch: gleichmäßiges Spektrum (keine Obertonstruktur), mittlere Lautstärke, kaum Zischlaut-Anteil
+            if breath > 0 {
+                var total: Float = 0, hf: Float = 0, peak: Float = 0, pmean: Float = 0
+                for k in 0..<bins { pEma[k] = 0.65 * pEma[k] + 0.35 * p[k] }   // über ~3 Frames gemittelt: Rauschen wird glatt, Stimmobertöne bleiben spitz
+                for k in 1..<bins { total += pEma[k] }
+                for k in hf0...hf1 { hf += pEma[k] }
+                for k in pk0...pk1 { peak = max(peak, pEma[k]); pmean += pEma[k] }
+                pmean /= Float(pk1 - pk0 + 1)
+                speechRef = max(ps, speechRef * 0.9997)
+                let rel = 10 * log10(max(ps, 1e-14) / max(speechRef, 1e-14))
+                let isBreath = snrDB > 5 && peak / max(pmean, 1e-14) < 2.8 && hf / max(total, 1e-14) < 0.6 && rel > -52 && rel < -10
+                let tgt: Float = isBreath ? 1 : 0
+                breathProb += (tgt > breathProb ? 0.5 : 0.05) * (tgt - breathProb)
+            }
             // Wiener-Gewinn mit Decision-Directed-Schätzung
             for k in 0..<bins {
                 let nk = noisePSD[k]
@@ -188,12 +219,28 @@ enum AudioProcessor {
                 g = g > prevG[k] ? prevG[k] + 0.7 * (g - prevG[k]) : prevG[k] + 0.35 * (g - prevG[k])
                 gains[k] = g
             }
+            // Nachhall: späte Reflexionen aus der verzögerten, abgeklungenen Leistung schätzen und abziehen
+            if reverb > 0 {
+                let old = history[histPos]
+                for k in 0..<bins {
+                    pSmooth[k] = 0.6 * pSmooth[k] + 0.4 * p[k]
+                    let late = revDecay * old[k]
+                    let gRev = max(revFloor, 1 - revBeta * late / max(pSmooth[k], 1e-14))
+                    gains[k] = min(gains[k], max(gRev, revFloor))
+                }
+                history[histPos] = pSmooth
+                histPos = (histPos + 1) % delay
+            }
             // Frequenzglättung
             var sm = gains
             for k in 1..<(bins - 1) { sm[k] = 0.25 * gains[k - 1] + 0.5 * gains[k] + 0.25 * gains[k + 1] }
             for k in 0..<bins {
                 prevG[k] = sm[k]
                 prevClean[k] = sm[k] * sm[k] * p[k]
+            }
+            if breath > 0 && breathProb > 0.02 {
+                let g = fromDB(-18 * Float(breath) * breathProb)
+                for k in 0..<bins { sm[k] *= g }
             }
             // Stimmen-Fokus
             if f > 0 {
@@ -215,6 +262,49 @@ enum AudioProcessor {
             if t % 2000 == 0 { progress(Double(t) / Double(totalFrames)) }
         }
         return out.map { Array($0[pad..<(pad + n)]) }
+    }
+
+    // MARK: Knackser
+
+    /// Findet kurze, impulsartige Ausreißer (Klicks, Knackser) und ersetzt sie durch lineare Interpolation.
+    /// Gibt die Anzahl der reparierten Stellen zurück. `amount` 0...1 = Empfindlichkeit.
+    @discardableResult
+    static func declick(_ x: inout [Float], amount: Double, dryRun: Bool = false) -> Int {
+        let n = x.count
+        guard n > 2048 else { return 0 }
+        let block = 1024
+        let k = Float(14 - 8 * min(1, max(0, amount)))     // Schwelle in Vielfachen der lokalen Streuung
+        // zweite Differenz hebt breitbandige Impulse hervor
+        var e = [Float](repeating: 0, count: n)
+        for i in 1..<(n - 1) { e[i] = abs(x[i + 1] - 2 * x[i] + x[i - 1]) }
+        var flagged = [Bool](repeating: false, count: n)
+        let rel = Float(7 - 3 * min(1, max(0, amount)))     // Klick muss ein Vielfaches des lokalen Signalpegels überschreiten
+        var b = 0
+        while b < n {
+            let end = min(n, b + block)
+            let med = percentile(Array(e[b..<end]), 0.5)
+            var rms: Float = 0
+            x.withUnsafeBufferPointer { vDSP_rmsqv($0.baseAddress! + b, 1, &rms, vDSP_Length(end - b)) }
+            let thr = max(k * med * 1.4826 * 1.5, rel * rms, 0.02)
+            for i in b..<end where e[i] > thr { flagged[i] = true }
+            b = end
+        }
+        var repaired = 0
+        var i = 1
+        while i < n - 1 {
+            guard flagged[i] else { i += 1; continue }
+            var j = i
+            var lastFlag = i
+            while j < n - 1 && j - lastFlag <= 3 { if flagged[j] { lastFlag = j }; j += 1 }
+            let start = max(1, i - 2), stop = min(n - 2, lastFlag + 2)
+            if stop - start <= 48 {
+                let a = x[start - 1], c = x[stop + 1]
+                if !dryRun { for m in start...stop { x[m] = a + (c - a) * Float(m - start + 1) / Float(stop - start + 2) } }
+                repaired += 1
+            }
+            i = max(lastFlag + 3, stop + 1)
+        }
+        return repaired
     }
 
     // MARK: De-Esser, Kompressor, Limiter

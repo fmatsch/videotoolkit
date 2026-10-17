@@ -53,9 +53,26 @@ enum Diagnosis {
             let sev: Severity = a.sharpness < sharpnessThreshold * 0.5 ? .moderate : .mild
             add(.sharpen, "Unscharf", "Feine Details fehlen. Schärfung wird hinzugefügt.", sev)
         }
-        if a.shakePercent > 0.35 {
-            let sev: Severity = a.shakePercent > 1.6 ? .severe : a.shakePercent > 0.8 ? .moderate : .mild
-            add(.stabilize, "Verwackelt", String(format: "Kamerawackeln ≈ %.1f %% der Bildbreite.", a.shakePercent), sev)
+        if a.shakePercent > 0.35 || a.rotShakeDegrees > 0.5 {
+            let level = max(a.shakePercent / 0.8, a.rotShakeDegrees / 1.0)
+            let sev: Severity = level > 2 ? .severe : level > 1 ? .moderate : .mild
+            var detail = String(format: "Kamerawackeln ≈ %.1f %% der Bildbreite", a.shakePercent)
+            if a.rotShakeDegrees > 0.5 { detail += String(format: ", Kippen ≈ %.1f°", a.rotShakeDegrees) }
+            add(.stabilize, "Verwackelt", detail + ". Kamerabahn wird geglättet.", sev)
+        }
+        if a.panSpeedPercent > 1.2 {
+            add(.rollingShutter, "Schiefe bei schnellen Schwenks (Rolling Shutter)",
+                String(format: "Schnelle Seitwärtsbewegung (%.1f %% der Bildbreite pro Frame) lässt senkrechte Linien kippen.", a.panSpeedPercent),
+                a.panSpeedPercent > 3 ? .moderate : .mild)
+        }
+        if a.combFraction > 0.06 {
+            add(.deinterlace, "Zeilensprung (Interlacing)", String(format: "Kammartefakte in %.0f %% der Bildbereiche.", a.combFraction * 100), a.combFraction > 0.25 ? .moderate : .mild)
+        }
+        if a.vignetteRatio < 0.68 && a.vignetteP75 < 0.8 {
+            add(.vignette, "Randabdunklung (Vignettierung)", String(format: "Selbst die hellste Ecke erreicht nur %.0f %% der Mittenhelligkeit.", a.vignetteRatio * 100), a.vignetteRatio < 0.5 ? .moderate : .mild)
+        }
+        if a.bandingFraction > 0.10 {
+            add(.deband, "Streifen in Verläufen (Banding)", String(format: "%.0f %% der Bildfläche zeigen sichtbare Helligkeitsstufen – meist durch starke Kompression. Feines Rauschen verdeckt sie.", a.bandingFraction * 100), .info)
         }
         if a.flickerPercent > 1.2 {
             add(.deflicker, "Helligkeitsflackern", String(format: "Frame-zu-Frame-Schwankung ≈ %.1f %%.", a.flickerPercent), a.flickerPercent > 3 ? .moderate : .mild)
@@ -108,9 +125,18 @@ enum Diagnosis {
             s.sharpen = mix(0, a.sharpness < sharpnessThreshold * 0.5 ? 1.1 : 0.6)
         case .stabilize:
             s.stabilize = enabled
+            s.stabilizeRotation = true
             s.stabilizeStrength = 0.4 + 0.4 * min(1, a.shakePercent / 1.6)
         case .deflicker:
             s.deflicker = enabled
+        case .rollingShutter:
+            s.rollingShutter = mix(0, min(0.8, 0.3 + a.panSpeedPercent * 0.12))
+        case .deinterlace:
+            s.deinterlace = enabled
+        case .vignette:
+            s.vignetteFix = mix(0, min(1, max(0.3, (0.9 - a.vignetteRatio) / 0.5 + 0.2)))
+        case .deband:
+            s.deband = mix(0, 0.6)
         case .upscale:
             s.upscale = enabled ? min(2, max(1.5, 1080.0 / Double(max(a.height, 1)))) : 1
             s.aiUpscale = enabled && AIModels.upscalerAvailable
@@ -151,6 +177,9 @@ enum Diagnosis {
         if a.dynamicRangeDB > 32 {
             add(.audioDynamics, "Stark schwankende Lautstärke", String(format: "Pegelspanne ≈ %.0f dB – leise Passagen gehen unter.", a.dynamicRangeDB), a.dynamicRangeDB > 42 ? .moderate : .mild)
         }
+        if a.clicksPerMinute > 12 {
+            add(.audioClicks, "Knackser und Klicks", String(format: "Etwa %.0f Klicks pro Minute (Kontaktprobleme, Mundgeräusche, Digitalfehler).", a.clicksPerMinute), a.clicksPerMinute > 30 ? .moderate : .mild)
+        }
         if a.clippedFraction > 0.0005 {
             add(.audioLoudness, "Übersteuerung", String(format: "%.2f %% der Samples sind am Anschlag. Pegel wird neu ausgesteuert und begrenzt.", a.clippedFraction * 100), a.clippedFraction > 0.005 ? .severe : .moderate)
         } else if a.loudnessLUFS < -23 {
@@ -161,6 +190,7 @@ enum Diagnosis {
         return out.sorted { $0.severity > $1.severity }
     }
 
+    static let reverbThreshold = 0.16
     static let mudThreshold: Float = 12
     static let dullThreshold: Float = -16
     static let sibilanceThreshold: Float = -3
@@ -181,6 +211,9 @@ enum Diagnosis {
         case .audioClarity: s.clarity = mix(0, 0.7)
         case .audioVoice: s.voiceFocus = mix(0, a.snrDB < 18 ? 0.7 : 0.45)
         case .audioDeEss: s.deEss = mix(0, 0.5)
+        case .audioClicks: s.declick = mix(0, 0.5)
+        case .audioReverb: s.dereverb = mix(0, min(1, 0.4 + ((a.reverbRT60 ?? 0.5) - reverbThreshold) * 2))
+        case .audioBreath: s.breath = mix(0, 0.6)
         case .audioDynamics: s.compression = mix(0, 0.5)
         case .audioLoudness:
             s.normalize = enabled
