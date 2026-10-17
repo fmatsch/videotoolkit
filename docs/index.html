@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Toolkit — schlechte Videos reparieren, komplett lokal</title>
+<meta name="description" content="Native Mac-App, die schlecht aufgenommene Videos automatisch analysiert und repariert: Licht, Farbe, Rauschen, Wackeln, Ton und Stimme – mit lokalen KI-Modellen, ohne Cloud.">
+<link rel="icon" href="assets/icon.png">
+<style>
+  :root { --bg:#0b0d16; --card:#151827; --border:#262a3d; --text:#eef0f7; --dim:#9ba0b8; --accent:#9b6bff; --accent2:#4f7bff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background: radial-gradient(ellipse 1200px 600px at 50% -10%, #231c4a 0%, var(--bg) 55%); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif; line-height:1.6; -webkit-font-smoothing:antialiased; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .wrap { max-width:980px; margin:0 auto; padding:0 24px; }
+  header.hero { text-align:center; padding:96px 24px 56px; }
+  .hero-icon { width:120px; height:120px; border-radius:27px; box-shadow:0 20px 60px -10px rgba(155,107,255,.45),0 8px 24px rgba(0,0,0,.5); margin-bottom:28px; }
+  h1 { font-size:clamp(2.2rem,5vw,3.4rem); margin:0 0 14px; letter-spacing:-.02em; }
+  .tagline { font-size:1.2rem; color:var(--dim); max-width:660px; margin:0 auto 34px; }
+  .cta-row { display:flex; gap:14px; justify-content:center; flex-wrap:wrap; }
+  .btn { display:inline-flex; padding:13px 24px; border-radius:12px; font-weight:600; transition:transform .15s; }
+  .btn:hover { text-decoration:none; transform:translateY(-1px); }
+  .btn-primary { background:linear-gradient(180deg,#b896ff,var(--accent)); color:#1a0b3d; box-shadow:0 8px 20px -6px rgba(155,107,255,.6); }
+  .btn-secondary { background:var(--card); color:var(--text); border:1px solid var(--border); }
+  .note { margin:18px auto 0; font-size:.84rem; color:var(--dim); max-width:560px; }
+  section { padding:52px 0; }
+  h2 { font-size:1.7rem; margin:0 0 8px; letter-spacing:-.01em; }
+  .lead { color:var(--dim); margin:0 0 32px; max-width:660px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:22px; }
+  .card .ic { font-size:1.5rem; margin-bottom:10px; }
+  .card h3 { margin:0 0 6px; font-size:1.02rem; } .card p { margin:0; font-size:.92rem; color:var(--dim); }
+  .shots { display:grid; gap:24px; }
+  .shots img { width:100%; height:auto; display:block; border-radius:14px; border:1px solid var(--border); box-shadow:0 24px 48px -24px rgba(0,0,0,.6); }
+  .shots figcaption { margin-top:10px; font-size:.85rem; color:var(--dim); text-align:center; } figure { margin:0; }
+  .code { background:#0e1020; border:1px solid var(--border); border-radius:12px; padding:18px 20px; font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:.88rem; color:#d3d7ea; overflow-x:auto; white-space:pre; line-height:1.7; }
+  table { width:100%; border-collapse:collapse; font-size:.92rem; } td,th { text-align:left; padding:9px 12px; border-bottom:1px solid var(--border); vertical-align:top; } th { color:var(--dim); font-weight:500; }
+  ul.req { list-style:none; padding:0; margin:0 0 22px; display:grid; gap:8px; color:var(--dim); } ul.req li::before { content:"→ "; color:var(--accent); }
+  footer { border-top:1px solid var(--border); padding:36px 0 56px; text-align:center; color:var(--dim); font-size:.88rem; } footer a { color:var(--dim); }
+</style>
+</head>
+<body>
+<header class="hero">
+  <img class="hero-icon" src="assets/icon.png" alt="Video Toolkit App-Icon">
+  <h1>Video Toolkit</h1>
+  <p class="tagline">Schlecht aufgenommene Videos automatisch erkennen und reparieren – Licht, Farbe, Rauschen, Wackeln und Ton. Alles lokal auf deinem Mac, nichts geht in die Cloud.</p>
+  <div class="cta-row">
+    <a class="btn btn-primary" href="https://github.com/fmatsch/videotoolkit/releases/latest/download/Video-Toolkit-macOS.zip">⇩ Download für macOS</a>
+    <a class="btn btn-secondary" href="https://github.com/fmatsch/videotoolkit">Quellcode auf GitHub</a>
+  </div>
+  <p class="note">Apple Silicon, macOS 14 oder neuer. Die App ist nicht notarisiert – beim ersten Start Rechtsklick → „Öffnen“.</p>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>Erst Diagnose, dann Reparatur</h2>
+    <p class="lead">Beim Laden untersucht Video Toolkit das Video und schlägt konkrete Korrekturen vor. Jede lässt sich einzeln zu- und abschalten, ein Regler skaliert die Stärke. Im Experten-Modus stellst du alles selbst ein.</p>
+    <div class="shots">
+      <figure><img src="assets/screenshot-diagnose.png" alt="Diagnose mit Vorher/Nachher-Vorschau"><figcaption>Diagnose mit Vorher/Nachher-Schieber</figcaption></figure>
+    </div>
+  </section>
+
+  <section>
+    <h2>Was erkannt und repariert wird</h2>
+    <p class="lead">Die Analyse misst, statt zu raten – und erklärt in Klartext, was auffällt.</p>
+    <div class="grid">
+      <div class="card"><div class="ic">☀️</div><h3>Licht & Farbe</h3><p>Zu dunkel oder überbelichtet, abgesoffene Schatten, ausgebrannte Lichter, Gegenlicht bei Gesichtern (Apple Vision), flaues Bild, Farbstich, blasse Farben.</p></div>
+      <div class="card"><div class="ic">🎞️</div><h3>Rauschen & Schärfe</h3><p>Bildrauschen räumlich und zeitlich mindern, Schärfe über einen Re-Blur-Test beurteilen und gezielt nachschärfen.</p></div>
+      <div class="card"><div class="ic">📷</div><h3>Wackeln & Flackern</h3><p>Stabilisierung über eine geglättete Kamerabahn, Helligkeitsflackern wird szenenweise ausgeglichen.</p></div>
+      <div class="card"><div class="ic">🖼️</div><h3>Referenzbild</h3><p>Spiele ein Bild ein, dessen Look dein Video bekommen soll – Farben und Tonwerte werden per 3D-LUT angeglichen.</p></div>
+      <div class="card"><div class="ic">🎙️</div><h3>Ton & Stimme</h3><p>Rauschen, Netzbrummen (50/60 Hz), Dröhnen, Mulm, S-Laute, Lautstärkeschwankungen, Übersteuerung. Stimme klarer und in den Vordergrund, Lautheit auf −16 LUFS.</p></div>
+      <div class="card"><div class="ic">🎚️</div><h3>Experten-Modus</h3><p>Alle Parameter per Regler, 5-Band-EQ, Probehören von Original und Bearbeitung, Vorher/Nachher-Vergleich.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Lokale KI statt Cloud</h2>
+    <p class="lead">Die Modelle sind in der App eingebettet und laufen über Core ML auf dem Neural Engine bzw. der GPU. Die App ist mit App-Sandbox <strong>ohne Netzwerk-Berechtigung</strong> signiert – macOS verhindert damit technisch jede Internetverbindung.</p>
+    <table>
+      <tr><th>Aufgabe</th><th>Modell</th><th>Hinweis</th></tr>
+      <tr><td>Stimme entrauschen</td><td><a href="https://github.com/Rikorose/DeepFilterNet">DeepFilterNet3</a> (Core ML, INT8, 2 MB)</td><td>ca. 6× Echtzeit</td></tr>
+      <tr><td>Hochskalieren</td><td><a href="https://github.com/xinntao/Real-ESRGAN">Real-ESRGAN</a> x4v3 (Core ML)</td><td>langsam, sichtbar mehr Detail</td></tr>
+      <tr><td>Gesichter (Gegenlicht)</td><td>Apple Vision</td><td>on-device</td></tr>
+      <tr><td>Stabilisierung</td><td>Apple Vision Registrierung</td><td>on-device</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Selbst bauen</h2>
+    <p class="lead">Es genügen die Command Line Tools – Xcode ist nicht nötig.</p>
+    <div class="code">git clone https://github.com/fmatsch/videotoolkit.git
+cd videotoolkit
+Scripts/build_app.sh
+open "build/Video Toolkit.app"</div>
+  </section>
+</main>
+
+<footer>
+  <a href="https://github.com/fmatsch/videotoolkit">GitHub</a> · MIT-Lizenz · Modelle: siehe <a href="https://github.com/fmatsch/videotoolkit/blob/main/Models/NOTICE.md">NOTICE</a> · <a href="https://fmatsch.ist">fmatsch.ist</a>
+</footer>
+</body>
+</html>
