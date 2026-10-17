@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import AppKit
 import SwiftUI
+import Combine
 
 enum ProjectState: Equatable {
     case empty
@@ -22,6 +23,7 @@ final class Project: ObservableObject {
     @Published var state: ProjectState = .empty
     @Published var errorMessage: String?
     private(set) var asset: AVURLAsset?
+    private var videoOrientation = CGAffineTransform.identity
 
     // Analyse
     @Published var videoAnalysis: VideoAnalysis?
@@ -34,7 +36,8 @@ final class Project: ObservableObject {
     // Einstellungen
     @Published var expertMode = false
     @Published var video = VideoSettings() { didSet { if oldValue != video { videoChanged(old: oldValue) } } }
-    @Published var audio = AudioSettings()
+    @Published var audio = AudioSettings() { didSet { if oldValue != audio { audioChanged() } } }
+    private var liveAudioTask: Task<Void, Never>?
 
     // Referenz
     @Published var referenceImage: CGImage?
@@ -60,14 +63,14 @@ final class Project: ObservableObject {
     private var sceneLUTTask: Task<Void, Never>?
 
     // Vorschau
-    @Published var previewTime: Double = 0 { didSet { schedulePreview() } }
-    @Published var beforeImage: CGImage?
-    @Published var afterImage: CGImage?
-    @Published var compare: CompareMode = .split
+    @Published var previewTime: Double = 0
+    @Published var compare: CompareMode = .split { didSet { schedulePreview() } }
+    @Published var splitFraction: CGFloat = 0.5 { didSet { schedulePreview() } }
+    let playback = PlaybackController()
+    private var playbackSink: AnyCancellable?
+    private var fullMotionTask: Task<Void, Never>?
     @Published var duration: Double = 0
     private var renderer: PreviewRenderer?
-    private var currentFrame: (time: Double, image: CGImage)?
-    private var previewTask: Task<Void, Never>?
     private var stabCache: (key: [Double], frames: [MotionPass.StabFrame], zoom: CGFloat)?
     private var gainsCache: [Float]?
 
@@ -81,6 +84,10 @@ final class Project: ObservableObject {
     @Published var lastExport: URL?
     private var exportTask: Task<Void, Never>?
 
+    init() {
+        playbackSink = playback.$currentTime.sink { [weak self] t in self?.previewTime = t }
+    }
+
     var hasVideo: Bool { videoAnalysis != nil }
     var hasAudio: Bool { audioAnalysis != nil }
 
@@ -88,7 +95,7 @@ final class Project: ObservableObject {
 
     func open(_ url: URL) {
         stopAudio()
-        exportTask?.cancel(); previewTask?.cancel(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
+        exportTask?.cancel(); fullMotionTask?.cancel(); playback.stop(); lutTask?.cancel(); sceneTask?.cancel(); sceneLUTTask?.cancel()
         sceneMode = false; scenes = []; sceneReference = nil; sceneReferenceLabel = nil; sceneReferenceSceneID = nil
         sceneProgress = nil; sceneCutFrames = []
         self.url = url
@@ -97,7 +104,7 @@ final class Project: ObservableObject {
         videoAnalysis = nil; audioAnalysis = nil; videoIssues = []; audioIssues = []
         enabledFixes = []; intensity = 1
         video = VideoSettings(); audio = AudioSettings()
-        beforeImage = nil; afterImage = nil; currentFrame = nil; stabCache = nil; gainsCache = nil
+        stabCache = nil; gainsCache = nil
         let asset = AVURLAsset(url: url)
         self.asset = asset
         state = .analyzing(0, "Datei laden …")
@@ -109,6 +116,7 @@ final class Project: ObservableObject {
             duration = try await asset.load(.duration).seconds
             let hasV = !(try await asset.loadTracks(withMediaType: .video)).isEmpty
             let hasA = !(try await asset.loadTracks(withMediaType: .audio)).isEmpty
+            if let vt = try await asset.loadTracks(withMediaType: .video).first { videoOrientation = try await vt.load(.preferredTransform) }
             guard hasV || hasA else {
                 throw NSError(domain: "VideoToolkit", code: 2, userInfo: [NSLocalizedDescriptionKey: "Die Datei enthält weder Video noch Audio."])
             }
@@ -130,8 +138,9 @@ final class Project: ObservableObject {
             renderer = hasV ? PreviewRenderer(asset: asset) : nil
             reapplyFixes()
             state = .ready
-            previewTime = min(duration * 0.3, max(0, duration - 0.1))
-            schedulePreview(immediately: true)
+            await playback.load(asset: asset, hasVideo: hasV)
+            if hasV { playback.seek(to: min(duration * 0.3, max(0, duration - 0.1))) }
+            schedulePreview()
         } catch {
             errorMessage = error.localizedDescription
             state = .empty
@@ -295,69 +304,88 @@ final class Project: ObservableObject {
             guard !Task.isCancelled else { return }
             lut = result
             referenceBusy = false
-            schedulePreview(immediately: true)
+            schedulePreview()
         }
     }
 
     // MARK: Vorschau
 
-    func schedulePreview(immediately: Bool = false) {
-        guard state == .ready || immediately, let renderer else { return }
-        previewTask?.cancel()
-        let t = previewTime
-        var settings = video, lut = lut
-        if sceneMode, let idx = sceneIndex(at: t), sceneReference != nil {
-            let sc = scenes[idx]
-            settings = video.sceneAdjusted(strength: sceneMatchStrength, applyMatch: sc.enabled && sc.lut != nil)
-            lut = sc.lut
+    /// Aktuelle Einstellungen an den Player übergeben; der angehaltene Frame wird neu gerendert.
+    func schedulePreview() {
+        guard let va = videoAnalysis else { return }
+        ensureFullMotion()
+        var stab: [MotionPass.StabFrame] = [], zoom: CGFloat = 1, gains: [Float] = []
+        if let m = va.motion, m.count > 0 {
+            if video.stabilize || video.rollingShutter > 0.001 {
+                let key = [video.stabilizeStrength, video.stabilize ? 1 : 0, video.stabilizeRotation ? 1 : 0, video.rollingShutter, Double(m.count), Double(m.cuts.count)]
+                if stabCache?.key != key {
+                    let r = MotionPass.stabilization(m, strength: video.stabilizeStrength, translate: video.stabilize,
+                                                     rotation: video.stabilizeRotation, rollingShutter: video.rollingShutter,
+                                                     analysisHeight: m.analysisWidth * Double(va.height) / Double(va.width))
+                    stabCache = (key, r.frames, r.zoom)
+                }
+                if let c = stabCache { stab = c.frames; zoom = c.zoom }
+            }
+            if video.deflicker {
+                if gainsCache == nil || gainsCache?.count != m.count { gainsCache = MotionPass.deflickerGains(m) }
+                gains = gainsCache ?? []
+            }
         }
-        let params = frameParams(at: t, settings: settings)
-        let cached = currentFrame
-        previewTask = Task {
-            if !immediately { try? await Task.sleep(nanoseconds: 60_000_000) }
-            guard !Task.isCancelled else { return }
-            var frame: CGImage?
-            if let c = cached, abs(c.time - t) < 0.0005 { frame = c.image } else { frame = await renderer.frame(at: t) }
-            guard let frame, !Task.isCancelled else { return }
-            let scale = CGFloat(frame.width) / CGFloat(videoAnalysis?.width ?? frame.width)
-            var p = params
-            p.offset = CGPoint(x: p.offset.x * scale, y: p.offset.y * scale)
-            let after = await Task.detached(priority: .userInitiated) {
-                renderer.render(frame: frame, settings: settings, lut: lut, params: p)
-            }.value
-            guard !Task.isCancelled else { return }
-            currentFrame = (t, frame)
-            beforeImage = frame
-            afterImage = after
+        let renders: [SceneRender] = (sceneMode && sceneReference != nil)
+            ? scenes.map { SceneRender(start: $0.start, enabled: $0.enabled, lut: $0.lut, strength: sceneMatchStrength) } : []
+        let (v, l, cmp, spl) = (video, lut, compare, splitFraction)
+        let fps = va.motion?.fps ?? va.fps, aw = va.motion?.analysisWidth ?? 480
+        let ah = aw * Double(va.height) / Double(va.width)
+        let orient = videoOrientation
+        playback.state.update {
+            $0.settings = v; $0.lut = l; $0.sceneRenders = renders
+            $0.stab = stab; $0.stabZoom = zoom; $0.gains = gains
+            $0.fps = fps; $0.analysisWidth = aw; $0.analysisHeight = ah
+            $0.orientation = orient; $0.compare = cmp; $0.split = spl
+        }
+        playback.refreshFrame()
+    }
+
+    /// Stabilisierung/Flackern brauchen die Bewegungsdaten des ganzen Videos (Analyse deckt zunächst nur 90 s ab).
+    private func ensureFullMotion() {
+        guard let asset, let m = videoAnalysis?.motion, !m.coversWholeAsset, fullMotionTask == nil,
+              video.stabilize || video.deflicker || video.rollingShutter > 0.001 else { return }
+        playback.audioStatus = "Bewegung im ganzen Video analysieren …"
+        fullMotionTask = Task {
+            let cuts = sceneCutFrames
+            if var full = try? await MotionPass.run(asset: asset, maxSeconds: nil, progress: { _ in }) {
+                full.cuts.formUnion(cuts)
+                videoAnalysis?.motion = full
+                stabCache = nil; gainsCache = nil
+            }
+            playback.audioStatus = nil
+            fullMotionTask = nil
+            schedulePreview()
         }
     }
 
-    /// Stabilisierung/Flackern für den Vorschau-Frame (in Pixeln des Originalvideos).
-    private func frameParams(at t: Double, settings: VideoSettings) -> FrameParams {
-        var p = FrameParams()
-        guard let va = videoAnalysis, let m = va.motion, m.count > 0 else { return p }
-        let idx = max(0, Int(t * m.fps))
-        guard idx < m.count else { return p }   // Analyse deckt nur den Anfang ab; Export rechnet vollständig
-        if settings.stabilize || settings.rollingShutter > 0.001 {
-            let key = [settings.stabilizeStrength, settings.stabilize ? 1 : 0, settings.stabilizeRotation ? 1 : 0, settings.rollingShutter]
-            if stabCache?.key != key {
-                let r = MotionPass.stabilization(m, strength: settings.stabilizeStrength, translate: settings.stabilize,
-                                                 rotation: settings.stabilizeRotation, rollingShutter: settings.rollingShutter,
-                                                 analysisHeight: m.analysisWidth * Double(va.height) / Double(va.width))
-                stabCache = (key, r.frames, r.zoom)
-            }
-            if let c = stabCache, idx < c.frames.count {
-                let k = Double(va.width) / m.analysisWidth
-                p.offset = CGPoint(x: c.frames[idx].dx * k, y: c.frames[idx].dy * k)
-                p.rotation = CGFloat(c.frames[idx].rot); p.shear = CGFloat(c.frames[idx].shear)
-                p.zoom = c.zoom
-            }
+    func seek(to t: Double) { playback.seek(to: t) }
+
+    // MARK: Ton in der Wiedergabe
+
+    private func audioChanged() {
+        guard playback.useProcessedAudio else { return }
+        liveAudioTask?.cancel()
+        liveAudioTask = Task {
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Task.isCancelled else { return }
+            playback.prepareProcessedAudio(settings: audio, noise: audioAnalysis?.noiseProfile)
         }
-        if settings.deflicker {
-            if gainsCache == nil { gainsCache = MotionPass.deflickerGains(m) }
-            if let g = gainsCache, idx < g.count { p.flickerGain = g[idx] }
+    }
+
+    /// Schaltet den bearbeiteten Ton in der Wiedergabe ein/aus (rechnet ihn beim ersten Mal im Hintergrund).
+    func setLiveProcessedAudio(_ on: Bool) {
+        if on {
+            playback.prepareProcessedAudio(settings: audio, noise: audioAnalysis?.noiseProfile)
+            playback.useProcessedAudio = true
+        } else {
+            playback.useProcessedAudio = false
         }
-        return p
     }
 
     // MARK: Audio-Vorschau

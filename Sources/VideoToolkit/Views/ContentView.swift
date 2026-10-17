@@ -28,7 +28,7 @@ struct ContentView: View {
             case .analyzing(let p, let text): AnalyzingView(progress: p, text: text)
             case .ready, .exporting:
                 HSplitView {
-                    PreviewPane().frame(minWidth: 520)
+                    PreviewPane(playback: project.playback).frame(minWidth: 520)
                     inspector.frame(minWidth: 360, idealWidth: 400, maxWidth: 520)
                 }
             }
